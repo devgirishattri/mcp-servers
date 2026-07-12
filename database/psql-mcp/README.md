@@ -7,7 +7,7 @@ A Model Context Protocol (MCP) server for guarded PostgreSQL database access.
 - Optional raw `SELECT` execution inside dedicated read-only transactions; disabled by default
 - Schema, table, and column identifier validation and quoting
 - Schema, table, and SELECT-function allowlists
-- First-database-use rejection of superuser, administrative, server-file, table-write, and sequence-write privileges in read mode
+- First-database-use rejection of superuser, administrative, server-file, backend-signaling, table-write, and sequence-write privileges in read mode
 - Optional insert, update, and delete tools with a default-deny policy
 - Structured, parameterized write filters with affected-row limits
 - Request, input, row, response-size, connection, and statement limits
@@ -63,10 +63,10 @@ when it starts the process. No `.env` file needs to be created in this project;
 | `MCP_MODE` | Separate deployment mode: `read` or `write` | `read` |
 | `VERIFY_DB_PRIVILEGES` | Reject unsafe effective database privileges at first use | `true` |
 | `ALLOW_ARBITRARY_SELECT` | Expose `execute_query`; requires read-only DB grants | `false` |
-| `ALLOWED_SCHEMAS` | Comma-separated schema allowlist | `public` |
-| `ALLOWED_TABLES` | Optional comma-separated `schema.table` allowlist | All tables in allowed schemas |
+| `ALLOWED_SCHEMAS` | Comma-separated schema allowlist for structured tools | `public` |
+| `ALLOWED_TABLES` | Optional comma-separated `schema.table` allowlist for structured tools | All tables in allowed schemas |
 | `ALLOWED_COLUMNS` | Optional comma-separated `schema.table.column` allowlist for structured tools | All columns in allowed tables |
-| `ALLOWED_SELECT_FUNCTIONS` | Functions permitted in optional raw SELECT queries | Empty |
+| `ALLOWED_SELECT_FUNCTIONS` | Lowercase functions permitted in optional raw SELECT queries; qualified calls require `schema.function` | Empty |
 | `ALLOW_WRITES` | Expose and enable insert/update tools | `false` |
 | `ALLOW_DELETE` | Expose and enable delete; also requires `ALLOW_WRITES=true` | `false` |
 | `RETURN_MUTATION_ROWS` | Return full changed rows; otherwise return counts only | `false` |
@@ -98,13 +98,21 @@ The default configuration exposes only:
 
 - `describe_table`: Return the validated table structure.
 - `list_tables`: List tables in a validated schema.
-- `list_schemas`: List non-system schemas.
+- `list_schemas`: List allowlisted non-system schemas.
 
 Setting `ALLOW_ARBITRARY_SELECT=true` exposes `execute_query`; every called
 function must also appear in `ALLOWED_SELECT_FUNCTIONS`, while dangerous host,
 large-object, backend-signaling, and advisory-lock functions remain blocked.
 `ALLOWED_COLUMNS` is intentionally incompatible with arbitrary SELECT; keep raw
 SELECT disabled or expose curated views when column-level boundaries are needed.
+
+`ALLOWED_SCHEMAS`, `ALLOWED_TABLES`, and `ALLOWED_COLUMNS` constrain structured
+discovery and mutation tools. Raw SELECT table access is not inferred from SQL
+text; constrain it with PostgreSQL grants or curated views. Function allowlist
+entries are normalized to lowercase, schema-qualified calls require a matching
+`schema.function` entry, and quoted identifiers are matched case-sensitively.
+Mixed-case quoted function names therefore cannot be enabled through the
+current environment-variable allowlist.
 
 Write tools require a separate `MCP_MODE=write` deployment plus
 `ALLOW_WRITES=true`. Delete additionally requires `ALLOW_DELETE=true`. Every
@@ -141,7 +149,7 @@ When explicitly enabled, `execute_query`:
 - permits one optional trailing semicolon but rejects interior semicolons, SQL comments, transaction control, and mutation/DDL keywords outside string literals and quoted identifiers;
 - forces PostgreSQL's extended query protocol, including for an empty parameter list, so the database parser rejects multiple statements;
 - runs on a dedicated connection inside `BEGIN READ ONLY` and always rolls back;
-- requires every function call to be allowlisted and always blocks known privileged functions;
+- detects quoted, unquoted, and schema-qualified function calls, requires every call to be allowlisted, and always blocks known privileged functions;
 - applies a server-side field cap, fetches one row at a time through a transaction-scoped cursor, and stops before `MAX_ROWS`, `MAX_COLUMNS`, or `MAX_RESPONSE_BYTES` is exceeded.
 
 The query validator is defense in depth, not a replacement for database permissions. `VERIFY_DB_PRIVILEGES=true` rejects unsafe read-mode roles, but grants should still be restricted to the allowed schemas, tables, and functions.
@@ -150,7 +158,7 @@ The query validator is defense in depth, not a replacement for database permissi
 
 - `disable`: Do not use TLS.
 - `require`: Encrypt without certificate verification.
-- `verify-full`: Verify the certificate chain and hostname using Node.js runtime-default CA trust or `DB_SSL_CA_FILE`.
+- `verify-full`: Verify the certificate chain and the DNS or IP identity in `DB_HOST` using Node.js runtime-default CA trust or `DB_SSL_CA_FILE`.
 
 ## Claude Code Integration
 

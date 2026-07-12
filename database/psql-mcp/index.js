@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { checkServerIdentity } from "node:tls";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -52,9 +53,78 @@ if (envResult.error) {
 
 const { Pool } = pg;
 const TIMEZONE_PATTERN = /^[A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*$/;
+const SYSTEM_SCHEMA_PATTERN = /^(?:information_schema|pg_catalog|pg_toast(?:_temp_\d+)?|pg_temp(?:_\d+)?)$/i;
 const FORBIDDEN_SQL_PATTERN = /(;|--|\/\*|\*\/|\b(insert|update|delete|merge|drop|alter|create|truncate|exec|execute|grant|revoke|backup|restore|into|begin|commit|rollback|savepoint)\b)/i;
+const FORBIDDEN_SELECT_FUNCTIONS = new Set([
+  "pg_read_file",
+  "pg_read_binary_file",
+  "pg_ls_dir",
+  "pg_ls_logdir",
+  "pg_ls_waldir",
+  "pg_ls_tmpdir",
+  "pg_stat_file",
+  "pg_current_logfile",
+  "lo_import",
+  "lo_export",
+  "lo_close",
+  "lo_creat",
+  "lo_create",
+  "lo_get",
+  "lo_lseek",
+  "lo_lseek64",
+  "lo_open",
+  "lo_put",
+  "lo_tell",
+  "lo_tell64",
+  "lo_truncate",
+  "lo_truncate64",
+  "lo_unlink",
+  "loread",
+  "lowrite",
+  "lo_from_bytea",
+  "pg_terminate_backend",
+  "pg_cancel_backend",
+  "pg_log_backend_memory_contexts",
+  "pg_backup_start",
+  "pg_backup_stop",
+  "pg_create_restore_point",
+  "pg_notify",
+  "pg_promote",
+  "pg_reload_conf",
+  "pg_rotate_logfile",
+  "pg_sleep",
+  "pg_sleep_for",
+  "pg_sleep_until",
+  "pg_switch_wal",
+  "pg_wal_replay_pause",
+  "pg_wal_replay_resume",
+  "set_config",
+  "pg_advisory_lock",
+  "pg_advisory_lock_shared",
+  "pg_advisory_unlock",
+  "pg_advisory_unlock_all",
+  "pg_advisory_unlock_shared",
+  "pg_advisory_xact_lock",
+  "pg_advisory_xact_lock_shared",
+  "pg_try_advisory_lock",
+  "pg_try_advisory_lock_shared",
+  "pg_try_advisory_xact_lock",
+  "pg_try_advisory_xact_lock_shared",
+]);
 
-function maskSqlLiterals(query) {
+function parseAllowedSchemas(value) {
+  const schemas = new Set(
+    Array.from(parseCsvSet(value, "public")).filter(
+      (schemaName) => !SYSTEM_SCHEMA_PATTERN.test(schemaName)
+    )
+  );
+  if (schemas.size === 0) {
+    schemas.add("public");
+  }
+  return schemas;
+}
+
+function maskSqlLiterals(query, { preserveQuotedIdentifiers = false } = {}) {
   const characters = Array.from(query);
 
   for (let index = 0; index < query.length; index += 1) {
@@ -62,25 +132,32 @@ function maskSqlLiterals(query) {
 
     if (character === "'" || character === '"') {
       const quote = character;
+      const preserveIdentifier = quote === '"' && preserveQuotedIdentifiers;
       const escapeString =
         quote === "'" &&
         (query[index - 1] === "E" || query[index - 1] === "e") &&
         (index < 2 || !/[A-Za-z0-9_$]/.test(query[index - 2]));
-      characters[index] = " ";
+      if (!preserveIdentifier) {
+        characters[index] = " ";
+      }
       index += 1;
       let terminated = false;
 
       while (index < query.length) {
-        characters[index] = query[index] === "\n" ? "\n" : " ";
+        if (!preserveIdentifier) {
+          characters[index] = query[index] === "\n" ? "\n" : " ";
+        }
         if (query[index] === "\\" && escapeString) {
           index += 1;
-          if (index < query.length) {
+          if (index < query.length && !preserveIdentifier) {
             characters[index] = query[index] === "\n" ? "\n" : " ";
           }
         } else if (query[index] === quote) {
           if (query[index + 1] === quote) {
             index += 1;
-            characters[index] = " ";
+            if (!preserveIdentifier) {
+              characters[index] = " ";
+            }
           } else {
             terminated = true;
             break;
@@ -143,7 +220,7 @@ class PostgreSQLMCPServer {
       throw new Error("ALLOW_WRITES=true requires a separate MCP_MODE=write deployment.");
     }
     this.allowArbitrarySelect = process.env.ALLOW_ARBITRARY_SELECT === "true";
-    this.allowedSchemas = parseCsvSet(process.env.ALLOWED_SCHEMAS, "public");
+    this.allowedSchemas = parseAllowedSchemas(process.env.ALLOWED_SCHEMAS);
     this.allowedTables = parseCsvSet(process.env.ALLOWED_TABLES);
     this.allowedColumns = parseCsvSet(process.env.ALLOWED_COLUMNS);
     if (this.allowArbitrarySelect && this.allowedColumns.size > 0) {
@@ -152,9 +229,7 @@ class PostgreSQLMCPServer {
       );
     }
     this.allowedSelectFunctions = parseCsvSet(process.env.ALLOWED_SELECT_FUNCTIONS);
-    this.forbiddenSelectFunctions = parseCsvSet(
-      "pg_read_file,pg_read_binary_file,pg_ls_dir,pg_ls_logdir,pg_ls_waldir,pg_ls_tmpdir,pg_stat_file,pg_current_logfile,lo_import,lo_export,lo_get,lo_put,lo_from_bytea,pg_terminate_backend,pg_cancel_backend,pg_advisory_lock"
-    );
+    this.forbiddenSelectFunctions = new Set(FORBIDDEN_SELECT_FUNCTIONS);
     this.verifyDbPrivileges = process.env.VERIFY_DB_PRIVILEGES !== "false";
     this.maxRows = this.parseNonNegativeInteger(process.env.MAX_ROWS, 1000, "MAX_ROWS");
     this.maxAffectedRows = this.parseNonNegativeInteger(
@@ -245,7 +320,11 @@ class PostgreSQLMCPServer {
     }
 
     if (mode === "verify-full") {
-      const ssl = { rejectUnauthorized: true };
+      const ssl = {
+        rejectUnauthorized: true,
+        checkServerIdentity: (_hostname, certificate) =>
+          checkServerIdentity(host, certificate),
+      };
       const caFile = process.env.DB_SSL_CA_FILE;
       if (caFile) {
         const caPath = isAbsolute(caFile) ? caFile : resolve(__dirname, caFile);
@@ -349,8 +428,11 @@ class PostgreSQLMCPServer {
     if (FORBIDDEN_SQL_PATTERN.test(maskedQuery)) {
       throw new Error("Query contains forbidden SQL syntax.");
     }
+    const functionQuery = maskSqlLiterals(normalizedQuery, {
+      preserveQuotedIdentifiers: true,
+    });
     assertAllowedFunctions(
-      maskedQuery,
+      functionQuery,
       this.allowedSelectFunctions,
       this.forbiddenSelectFunctions
     );
@@ -452,6 +534,7 @@ class PostgreSQLMCPServer {
             pg_has_role(current_user, 'pg_read_server_files', 'MEMBER') AS can_read_server_files,
             pg_has_role(current_user, 'pg_write_server_files', 'MEMBER') AS can_write_server_files,
             pg_has_role(current_user, 'pg_execute_server_program', 'MEMBER') AS can_execute_server_program,
+            pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') AS can_signal_backend,
             EXISTS (
               SELECT 1
               FROM pg_class AS candidate
@@ -863,6 +946,7 @@ class PostgreSQLMCPServer {
       SELECT schema_name
       FROM information_schema.schemata
       WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+        AND schema_name !~ '^pg_(temp(?:_[0-9]+)?|toast_temp_[0-9]+)$'
       ORDER BY schema_name
     `);
 
@@ -1072,7 +1156,10 @@ if (isMainModule) {
 export {
   FILTERS_INPUT_SCHEMA,
   FORBIDDEN_SQL_PATTERN,
+  FORBIDDEN_SELECT_FUNCTIONS,
+  SYSTEM_SCHEMA_PATTERN,
   maskSqlLiterals,
   normalizeSelectQuery,
+  parseAllowedSchemas,
   PostgreSQLMCPServer,
 };

@@ -132,12 +132,14 @@ export function createJsonResult(payload, maxResponseBytes) {
 }
 
 export function parseCsvSet(value, fallback = "") {
-  return new Set(
-    String(value ?? fallback)
+  const parse = (source) => new Set(
+    String(source ?? "")
       .split(",")
       .map((item) => item.trim().toLowerCase())
       .filter(Boolean)
   );
+  const parsed = parse(value);
+  return parsed.size > 0 || fallback === "" ? parsed : parse(fallback);
 }
 
 export function assertAllowedSchema(schemaName, allowedSchemas) {
@@ -204,23 +206,36 @@ export function assertInputBudget(value, label, maxBytes, maxItems) {
 }
 
 export function assertAllowedFunctions(maskedQuery, allowedFunctions, forbiddenFunctions = new Set()) {
+  const identifierPattern = `(?:"(?:[^"]|"")*"|[\\p{L}_][\\p{L}\\p{N}_$]*)`;
   const queryWithoutDerivedColumnAliases = maskedQuery.replace(
-    /\bAS\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)/gi,
+    new RegExp(`\\bAS\\s+${identifierPattern}\\s*\\([^)]*\\)`, "giu"),
     " "
   );
   const calls = queryWithoutDerivedColumnAliases.matchAll(
-    /\b((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s*\(/g
+    new RegExp(
+      `(?<![\\p{L}\\p{N}_$"])(?:(${identifierPattern})\\s*\\.\\s*)?(${identifierPattern})\\s*\\(`,
+      "gu"
+    )
   );
+
+  const normalizeIdentifier = (identifier) => {
+    if (identifier.startsWith('"')) {
+      return identifier.slice(1, -1).replace(/""/g, '"');
+    }
+    return identifier.toLowerCase();
+  };
+
   for (const match of calls) {
-    const qualifiedName = match[1].toLowerCase();
-    const shortName = qualifiedName.split('.').at(-1);
-    if (NON_FUNCTION_TOKENS.has(shortName)) {
+    const qualifier = match[1] ? normalizeIdentifier(match[1]) : null;
+    const shortName = normalizeIdentifier(match[2]);
+    const qualifiedName = qualifier ? `${qualifier}.${shortName}` : shortName;
+    if (!qualifier && !match[2].startsWith('"') && NON_FUNCTION_TOKENS.has(shortName)) {
       continue;
     }
     if (forbiddenFunctions.has(qualifiedName) || forbiddenFunctions.has(shortName)) {
       throw new Error(`Query calls a forbidden function: ${qualifiedName}`);
     }
-    const allowed = qualifiedName.includes('.')
+    const allowed = qualifier
       ? allowedFunctions.has(qualifiedName)
       : allowedFunctions.has(shortName);
     if (!allowed) {

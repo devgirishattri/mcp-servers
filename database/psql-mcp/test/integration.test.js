@@ -65,7 +65,7 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
         ALLOW_ARBITRARY_SELECT: "true",
         ALLOWED_SCHEMAS: schema,
         ALLOWED_TABLES: `${schema}.sample`,
-        ALLOWED_SELECT_FUNCTIONS: "repeat,generate_series",
+        ALLOWED_SELECT_FUNCTIONS: "repeat,generate_series,pg_catalog.count",
         VERIFY_DB_PRIVILEGES: "true",
         MAX_ROWS: "2",
       },
@@ -80,6 +80,15 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
         );
         assert.equal(result.rowCount, 2);
         assert.equal(result.truncated, true);
+
+        const quotedFunction = JSON.parse(
+          (
+            await server.executeQuery(
+              `SELECT "pg_catalog"."count"(*) AS total FROM "${schema}".sample`
+            )
+          ).content[0].text
+        );
+        assert.equal(quotedFunction.rows[0].total, 3);
 
         const strings = JSON.parse(
           (await server.executeQuery(String.raw`SELECT 'ordinary' AS a, E'escape\n' AS b, $$dollar;value$$ AS c;`))
@@ -122,6 +131,14 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
           server.executeQuery("SELECT pg_read_file('/etc/passwd')"),
           /forbidden function/
         );
+        await assert.rejects(
+          server.executeQuery('SELECT "pg_catalog"."pg_read_file"($$/etc/passwd$$)'),
+          /forbidden function/
+        );
+        await assert.rejects(
+          server.executeQuery("SELECT pg_try_advisory_lock(1)"),
+          /forbidden function/
+        );
         assert.throws(() => server.validateSelectQuery("SELECT 1 -- comment"), /forbidden SQL syntax/);
         await assert.rejects(server.describeTable("sample", "public"), /not allowlisted/);
 
@@ -144,6 +161,35 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
         );
       }
     );
+
+    await admin.query(`GRANT pg_signal_backend TO "${role}"`);
+    try {
+      await withEnvironment(
+        {
+          DB_HOST: adminConfig.host,
+          DB_PORT: String(adminConfig.port),
+          DB_NAME: adminConfig.database,
+          DB_USER: role,
+          DB_PASSWORD: rolePassword,
+          DB_SSL_MODE: "disable",
+          MCP_MODE: "read",
+          VERIFY_DB_PRIVILEGES: "true",
+        },
+        async () => {
+          const signalingServer = new PostgreSQLMCPServer();
+          try {
+            await assert.rejects(
+              signalingServer.ensureSecurityVerified(),
+              /unsafe privileges: can_signal_backend/
+            );
+          } finally {
+            await signalingServer.shutdown();
+          }
+        }
+      );
+    } finally {
+      await admin.query(`REVOKE pg_signal_backend FROM "${role}"`);
+    }
 
     await withEnvironment(
       {

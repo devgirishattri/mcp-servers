@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Readable } from "node:stream";
 import {
+  FORBIDDEN_SELECT_FUNCTIONS,
   maskSqlLiterals,
   normalizeSelectQuery,
+  parseAllowedSchemas,
   PostgreSQLMCPServer,
 } from "../index.js";
-import { createLimitedLineInput } from "../../shared/security.js";
+import { createLimitedLineInput, parseCsvSet } from "../../shared/security.js";
 
 function createServer(overrides = {}) {
   return Object.assign(Object.create(PostgreSQLMCPServer.prototype), {
@@ -231,6 +233,15 @@ test("numeric configuration parsing rejects partial and unsafe values", () => {
   assert.throws(() => server.parsePositiveInteger("0", 1, "PORT"), /greater than zero/);
 });
 
+test("blank schema allowlists fall back to the secure documented default", () => {
+  assert.deepEqual(Array.from(parseCsvSet(undefined, "public")), ["public"]);
+  assert.deepEqual(Array.from(parseCsvSet("", "public")), ["public"]);
+  assert.deepEqual(Array.from(parseCsvSet(" , ", "public")), ["public"]);
+  assert.deepEqual(Array.from(parseCsvSet("reporting", "public")), ["reporting"]);
+  assert.deepEqual(Array.from(parseAllowedSchemas("pg_catalog,pg_temp,pg_temp_3")), ["public"]);
+  assert.deepEqual(Array.from(parseAllowedSchemas("reporting,pg_toast_temp_3")), ["reporting"]);
+});
+
 test("TLS modes support disable, require, and verify-full", async () => {
   const server = createServer();
   await withEnvironment({ DB_SSL: undefined, DB_SSL_MODE: "disable", DB_SSL_CA_FILE: undefined }, () => {
@@ -240,13 +251,39 @@ test("TLS modes support disable, require, and verify-full", async () => {
     assert.deepEqual(server.buildSslConfig(), { rejectUnauthorized: false });
   });
   await withEnvironment({ DB_SSL_MODE: "verify-full", DB_SSL_CA_FILE: undefined }, () => {
-    assert.deepEqual(server.buildSslConfig(), { rejectUnauthorized: true });
+    const ssl = server.buildSslConfig();
+    assert.equal(ssl.rejectUnauthorized, true);
+    assert.equal(typeof ssl.checkServerIdentity, "function");
   });
   await withEnvironment({ DB_SSL_MODE: "invalid" }, () => {
     assert.throws(() => server.buildSslConfig(), /disable, require, verify-full/);
   });
   await withEnvironment({ DB_HOST: "remote.example", DB_SSL: undefined, DB_SSL_MODE: undefined }, () => {
-    assert.deepEqual(server.buildSslConfig(), { rejectUnauthorized: true });
+    const ssl = server.buildSslConfig();
+    assert.equal(ssl.rejectUnauthorized, true);
+    assert.equal(
+      ssl.checkServerIdentity("localhost", {
+        subject: { CN: "localhost" },
+        subjectaltname: "DNS:remote.example",
+      }),
+      undefined
+    );
+  });
+  await withEnvironment({ DB_HOST: "127.0.0.1", DB_SSL_MODE: "verify-full" }, () => {
+    const ssl = server.buildSslConfig();
+    assert.equal(
+      ssl.checkServerIdentity("localhost", {
+        subject: { CN: "localhost" },
+        subjectaltname: "IP Address:127.0.0.1",
+      }),
+      undefined
+    );
+    assert.ok(
+      ssl.checkServerIdentity("localhost", {
+        subject: { CN: "localhost" },
+        subjectaltname: "DNS:localhost",
+      }) instanceof Error
+    );
   });
 });
 
@@ -327,12 +364,56 @@ test("oversized results are capped and tool errors are marked", () => {
 
 test("raw SELECT functions require an allowlist and dangerous functions remain forbidden", () => {
   const server = createServer({
-    allowedSelectFunctions: new Set(["count", "pg_read_file"]),
-    forbiddenSelectFunctions: new Set(["pg_read_file"]),
+    allowedSelectFunctions: new Set([
+      "count",
+      "custom$function",
+      "safe.foo",
+      "sécurisé",
+      "upper",
+      "pg_catalog.count",
+      ...FORBIDDEN_SELECT_FUNCTIONS,
+    ]),
+    forbiddenSelectFunctions: new Set(FORBIDDEN_SELECT_FUNCTIONS),
   });
   assert.doesNotThrow(() => server.validateSelectQuery("SELECT count(*) FROM sample"));
+  assert.doesNotThrow(() => server.validateSelectQuery('SELECT "count"(*) FROM sample'));
+  assert.doesNotThrow(() => server.validateSelectQuery("SELECT pg_catalog.count(*) FROM sample"));
+  assert.doesNotThrow(() => server.validateSelectQuery('SELECT "pg_catalog"."count"(*) FROM sample'));
+  assert.doesNotThrow(() => server.validateSelectQuery('SELECT "safe"."foo"()'));
+  assert.doesNotThrow(() => server.validateSelectQuery("SELECT count(upper(name)) FROM sample"));
+  assert.doesNotThrow(() => server.validateSelectQuery("SELECT custom$function()"));
+  assert.doesNotThrow(() => server.validateSelectQuery("SELECT sécurisé()"));
+  assert.doesNotThrow(() =>
+    server.validateSelectQuery('SELECT * FROM (VALUES (1)) AS "items"("value")')
+  );
+  assert.doesNotThrow(() => server.validateSelectQuery('SELECT "insert" FROM sample'));
   assert.throws(() => server.validateSelectQuery("SELECT lower(name) FROM sample"), /not allowlisted/);
+  assert.throws(() => server.validateSelectQuery("SELECT unlisted$function()"), /not allowlisted/);
+  assert.throws(() => server.validateSelectQuery("SELECT nonautorisé()"), /not allowlisted/);
+  assert.throws(() => server.validateSelectQuery('SELECT "Safe"."Foo"()'), /not allowlisted/);
+  assert.throws(
+    () => server.validateSelectQuery("SELECT count(lower(name)) FROM sample"),
+    /not allowlisted/
+  );
   assert.throws(() => server.validateSelectQuery("SELECT pg_read_file('/etc/passwd')"), /forbidden/);
+  assert.throws(
+    () => server.validateSelectQuery('SELECT "pg_catalog"."pg_read_file"($$/etc/passwd$$)'),
+    /forbidden/
+  );
+  assert.throws(
+    () => server.validateSelectQuery('SELECT pg_catalog."pg_read_file"($$/etc/passwd$$)'),
+    /forbidden/
+  );
+  assert.throws(
+    () => server.validateSelectQuery('SELECT "pg_catalog".pg_read_file($$/etc/passwd$$)'),
+    /forbidden/
+  );
+  for (const functionName of FORBIDDEN_SELECT_FUNCTIONS) {
+    assert.throws(
+      () => server.validateSelectQuery(`SELECT ${functionName}(1)`),
+      /forbidden/
+    );
+  }
 });
 
 test("schema policies and input budgets fail before database access", async () => {
@@ -375,15 +456,33 @@ test("database errors are normalized before returning through MCP", () => {
 });
 
 test("privileged PostgreSQL roles are rejected", async () => {
+  let verificationSql;
   const server = createServer({
     verifyDbPrivileges: true,
     securityVerified: false,
     securityVerificationPromise: null,
     pool: {
-      query: async () => ({ rows: [{ rolsuper: true, rolcreaterole: false }] }),
+      query: async (query) => {
+        verificationSql = query;
+        return { rows: [{ rolsuper: true, rolcreaterole: false }] };
+      },
     },
   });
   await assert.rejects(server.ensureSecurityVerified(), /unsafe privileges: rolsuper/);
+  assert.match(verificationSql, /pg_signal_backend/);
+
+  const signalServer = createServer({
+    verifyDbPrivileges: true,
+    securityVerified: false,
+    securityVerificationPromise: null,
+    pool: {
+      query: async () => ({ rows: [{ can_signal_backend: true }] }),
+    },
+  });
+  await assert.rejects(
+    signalServer.ensureSecurityVerified(),
+    /unsafe privileges: can_signal_backend/
+  );
 });
 
 test("stdio input is rejected before an oversized JSON-RPC line reaches the SDK", async () => {
