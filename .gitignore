@@ -70,6 +70,7 @@ tmp/
 temp/
 
 # Editor, agent, and OS-local state
+/workspace.sh
 .claude/
 .codex/
 .agents/
