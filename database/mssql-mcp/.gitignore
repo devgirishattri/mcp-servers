@@ -1,0 +1,67 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+build/
+coverage/
+.nyc_output/
+*.lcov
+*.tsbuildinfo
+
+# Secrets and local environment configuration
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+*.cer
+*.der
+*.kdb
+
+# Database exports and local data
+*.bak
+*.backup
+*.dump
+*.dmp
+*.sql
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+*.mdf
+*.ndf
+*.ldf
+
+# Logs, caches, runtime, and test artifacts
+logs/
+*.log
+*.pid
+*.pid.lock
+*.seed
+.npm/
+.cache/
+test-results/
+artifacts/
+.tmp/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Editor, agent, and OS-local state
+.claude/
+.codex/
+.agents/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db

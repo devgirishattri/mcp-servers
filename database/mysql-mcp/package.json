@@ -1,0 +1,30 @@
+{
+  "name": "mcp-mysql-server",
+  "version": "1.0.0",
+  "description": "Guarded MCP server for MySQL database operations",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --inspect index.js",
+    "test": "node --test test/server.test.js",
+    "test:integration": "RUN_INTEGRATION_TESTS=true node --test test/integration.test.js",
+    "test:all": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "mysql",
+    "database",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^16.4.7",
+    "mysql2": "^3.22.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

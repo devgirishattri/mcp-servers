@@ -1,0 +1,32 @@
+{
+  "name": "mcp-mssql-server",
+  "version": "1.0.0",
+  "description": "MCP server for Microsoft SQL Server database operations",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --inspect index.js",
+    "test": "node --test test/server.test.js",
+    "test:integration": "RUN_INTEGRATION_TESTS=true node --test test/integration.test.js",
+    "test:all": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "mssql",
+    "sqlserver",
+    "database",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "mssql": "^11.0.1",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/mssql": "^9.1.5"
+  }
+}

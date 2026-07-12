@@ -1,0 +1,148 @@
+name: Database MCP CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            database/mssql-mcp/package-lock.json
+            database/mysql-mcp/package-lock.json
+            database/psql-mcp/package-lock.json
+      - run: npm ci
+        working-directory: database/mssql-mcp
+      - run: npm ci
+        working-directory: database/mysql-mcp
+      - run: npm ci
+        working-directory: database/psql-mcp
+      - run: npm test
+        working-directory: database/mssql-mcp
+      - run: npm test
+        working-directory: database/mysql-mcp
+      - run: npm test
+        working-directory: database/psql-mcp
+      - run: node --check database/shared/security.js
+      - run: node --check database/mssql-mcp/index.js
+      - run: node --check database/mysql-mcp/index.js
+      - run: node --check database/psql-mcp/index.js
+      - run: npm audit --audit-level=high
+        working-directory: database/mssql-mcp
+      - run: npm audit --audit-level=high
+        working-directory: database/mysql-mcp
+      - run: npm audit --audit-level=high
+        working-directory: database/psql-mcp
+      - run: bash scripts/check-sensitive-files.sh
+
+  postgresql-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: mcp_integration
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: integration-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mcp_integration"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: database/psql-mcp/package-lock.json
+      - run: npm ci
+        working-directory: database/psql-mcp
+      - run: npm run test:integration
+        working-directory: database/psql-mcp
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: mcp_integration
+          DB_USER: postgres
+          DB_PASSWORD: integration-only-password
+
+  mssql-integration:
+    runs-on: ubuntu-latest
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: IntegrationOnly!2026Password
+        ports:
+          - 1433:1433
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: database/mssql-mcp/package-lock.json
+      - run: npm ci
+        working-directory: database/mssql-mcp
+      - name: Wait for SQL Server and run integration tests
+        working-directory: database/mssql-mcp
+        env:
+          DB_HOST: localhost
+          DB_PORT: "1433"
+          DB_NAME: mcp_mcp_test
+          DB_USER: sa
+          DB_PASSWORD: IntegrationOnly!2026Password
+        run: |
+          for attempt in $(seq 1 30); do
+            if npm run test:integration; then exit 0; fi
+            if [ "$attempt" -eq 30 ]; then exit 1; fi
+            sleep 2
+          done
+
+  mysql-integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: mcp_integration
+          MYSQL_ROOT_PASSWORD: IntegrationOnly!2026Password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -uroot -pIntegrationOnly!2026Password"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: database/mysql-mcp/package-lock.json
+      - run: npm ci
+        working-directory: database/mysql-mcp
+      - run: npm run test:integration
+        working-directory: database/mysql-mcp
+        env:
+          DB_HOST: localhost
+          DB_PORT: "3306"
+          DB_NAME: mcp_integration
+          DB_USER: root
+          DB_PASSWORD: IntegrationOnly!2026Password
+          DB_SSL_MODE: disable
