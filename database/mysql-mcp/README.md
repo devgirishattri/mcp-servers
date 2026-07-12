@@ -24,9 +24,9 @@ npm install
 ```
 
 Register the server with an MCP host and supply its database variables there,
-as shown in Claude Code Integration below or in the repository README. No
-`.env` file needs to be created in this project; `.env.example` is a variable
-reference only.
+as shown in the client integration sections below or in the repository README.
+No `.env` file needs to be created in this project; `.env.example` is a
+variable reference only.
 
 ## Configuration
 
@@ -162,6 +162,11 @@ keeps configuration with the MCP host instead of creating an `.env` file in the
 project. The password is read silently so its literal value is not saved in
 shell history.
 
+The command below uses Claude Code's `local` scope. Run it from the project
+where this server should be available. Use `-s user` instead to make the
+registration available across all of the user's projects. Do not use
+`-s project` with literal credentials in a tracked `.mcp.json` file.
+
 ```bash
 read -r -s MYSQL_MCP_PASSWORD
 
@@ -176,6 +181,56 @@ claude mcp add mysql -s local \
 
 unset MYSQL_MCP_PASSWORD
 ```
+
+Confirm the registration with `claude mcp list`. Remove it from the same
+project directory and scope with:
+
+```bash
+claude mcp remove mysql -s local
+```
+
+Removing the registration does not delete this repository, database data, or
+the database account.
+
+## Codex Integration
+
+Codex stores CLI-added MCP servers in the current user's default configuration
+at `~/.codex/config.toml`, making them available across that user's projects on
+the same Codex host. The current `codex mcp add` command has no project-scope
+option. For project-only registration, add the equivalent MCP table manually
+to a trusted project's `.codex/config.toml` and do not place literal
+credentials in a tracked project file.
+
+Supply the database variables during registration. The password is read
+silently so its literal value is not saved in shell history:
+
+```bash
+read -r -s MYSQL_MCP_PASSWORD
+
+codex mcp add mysql \
+  --env DB_HOST=localhost \
+  --env DB_PORT=3306 \
+  --env DB_NAME=your_database \
+  --env DB_USER=mcp_ro \
+  --env "DB_PASSWORD=$MYSQL_MCP_PASSWORD" \
+  --env DB_SSL_MODE=disable \
+  -- node /absolute/path/to/mcp-servers/database/mysql-mcp/index.js
+
+unset MYSQL_MCP_PASSWORD
+```
+
+Confirm the registration with `codex mcp list`. Remove the user-level
+registration with:
+
+```bash
+codex mcp remove mysql
+```
+
+Removing the registration does not delete this repository, database data, or
+the database account. Protect access to the user's Codex configuration because
+client-supplied environment values include database credentials. See the
+[Codex MCP documentation](https://developers.openai.com/codex/mcp) for advanced
+configuration and tool approval controls.
 
 ## Development and Integration Tests
 
