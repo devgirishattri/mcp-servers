@@ -53,6 +53,7 @@ if (envResult.error) {
 
 const { Pool } = pg;
 const TIMEZONE_PATTERN = /^[A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*$/;
+const SEARCH_PATH_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SYSTEM_SCHEMA_PATTERN = /^(?:information_schema|pg_catalog|pg_toast(?:_temp_\d+)?|pg_temp(?:_\d+)?)$/i;
 const FORBIDDEN_SQL_PATTERN = /(;|--|\/\*|\*\/|\b(insert|update|delete|merge|drop|alter|create|truncate|exec|execute|grant|revoke|backup|restore|into|begin|commit|rollback|savepoint)\b)/i;
 const FORBIDDEN_SELECT_FUNCTIONS = new Set([
@@ -342,6 +343,15 @@ class PostgreSQLMCPServer {
       throw new Error("DB_TIMEZONE contains unsupported characters.");
     }
 
+    const schemas = (process.env.DB_SEARCH_PATH ?? "pg_catalog").split(",").map((schema) => schema.trim());
+    if (!schemas.every((schema) => SEARCH_PATH_PATTERN.test(schema))) {
+      throw new Error("DB_SEARCH_PATH contains unsupported characters.");
+    }
+    if (schemas[0] !== "pg_catalog") {
+      schemas.unshift("pg_catalog");
+    }
+    const searchPath = schemas.join(",");
+
     const user = process.env.DB_USER?.trim();
     if (!user) {
       throw new Error(
@@ -355,7 +365,7 @@ class PostgreSQLMCPServer {
       database: process.env.DB_NAME || "postgres",
       user,
       password: process.env.DB_PASSWORD || "",
-      options: `-c timezone=${timezone} -c search_path=pg_catalog`,
+      options: `-c timezone=${timezone} -c search_path=${searchPath}`,
       max: this.parsePositiveInteger(process.env.MAX_CONNECTIONS, 10, "MAX_CONNECTIONS"),
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: this.connectionTimeoutMs,
@@ -366,6 +376,7 @@ class PostgreSQLMCPServer {
     debugLog(
       `[PostgreSQL MCP] Connecting to: ${config.host}:${config.port}/${config.database} as ${config.user}`
     );
+    debugLog(`[PostgreSQL MCP] Effective search_path: ${searchPath}`);
     debugLog(`[PostgreSQL MCP] SSL mode: ${process.env.DB_SSL_MODE || "legacy/default"}`);
     return config;
   }

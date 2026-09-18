@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { describe } from "node:test";
 import { Readable } from "node:stream";
 import {
   FORBIDDEN_SELECT_FUNCTIONS,
@@ -297,6 +297,7 @@ test("connection configuration keeps credentials structured and applies timezone
       DB_USER: "user@domain",
       DB_PASSWORD: "p@ss:word",
       DB_TIMEZONE: "Asia/Kolkata",
+      DB_SEARCH_PATH: undefined,
       DB_SSL_MODE: "disable",
       MAX_CONNECTIONS: "5",
     },
@@ -307,6 +308,44 @@ test("connection configuration keeps credentials structured and applies timezone
       assert.equal(config.options, "-c timezone=Asia/Kolkata -c search_path=pg_catalog");
     }
   );
+});
+
+describe("DB_SEARCH_PATH connection configuration", () => {
+  const environment = {
+    DB_USER: "mcp_reader",
+    DB_TIMEZONE: "UTC",
+    DB_PORT: "5432",
+    DB_SSL_MODE: "disable",
+    MAX_CONNECTIONS: "10",
+  };
+
+  for (const [value, expected] of [
+    [undefined, "pg_catalog"],
+    ["public", "pg_catalog,public"],
+    ["pg_catalog,public", "pg_catalog,public"],
+    [" public , audit ", "pg_catalog,public,audit"],
+    ["public,pg_catalog", "pg_catalog,public,pg_catalog"],
+    ["_private,Audit_2", "pg_catalog,_private,Audit_2"],
+  ]) {
+    test(`${JSON.stringify(value) ?? "unset"} yields ${expected}`, async () => {
+      await withEnvironment({ ...environment, DB_SEARCH_PATH: value }, () => {
+        assert.equal(
+          createServer().buildConnectionConfig().options,
+          `-c timezone=UTC -c search_path=${expected}`
+        );
+      });
+    });
+  }
+
+  for (const value of ["public;drop", "pub lic", '"public"', "$user", "", "public,,audit", ",public", "public,", "   ", "2public", "public -c timezone=UTC"]) {
+    test(`rejects ${JSON.stringify(value)}`, async () => {
+      await withEnvironment({ ...environment, DB_SEARCH_PATH: value }, () => {
+        assert.throws(() => createServer().buildConnectionConfig(), {
+          message: "DB_SEARCH_PATH contains unsupported characters.",
+        });
+      });
+    });
+  }
 });
 
 test("connection configuration requires an explicit non-empty DB_USER", async () => {

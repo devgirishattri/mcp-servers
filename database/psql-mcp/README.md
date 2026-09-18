@@ -47,6 +47,7 @@ when it starts the process. No `.env` file needs to be created in this project;
 | `DB_USER` | Dedicated database role; required and must not be empty | No default |
 | `DB_PASSWORD` | Database password | Empty |
 | `DB_TIMEZONE` | Session timezone | `UTC` |
+| `DB_SEARCH_PATH` | Comma-separated schema search path; pg_catalog is always kept first | `pg_catalog` |
 | `DB_SSL_MODE` | `disable`, `require`, or `verify-full` | Local: `disable`; remote: `verify-full` |
 | `DB_SSL_CA_FILE` | Optional CA file for `verify-full`; relative paths resolve from this directory | Node.js runtime-default CA trust |
 | `MAX_CONNECTIONS` | Maximum pooled connections | `10` |
@@ -105,6 +106,8 @@ function must also appear in `ALLOWED_SELECT_FUNCTIONS`, while dangerous host,
 large-object, backend-signaling, and advisory-lock functions remain blocked.
 `ALLOWED_COLUMNS` is intentionally incompatible with arbitrary SELECT; keep raw
 SELECT disabled or expose curated views when column-level boundaries are needed.
+
+With the default search path, tables must be schema-qualified; `DB_SEARCH_PATH=pg_catalog,public` lets unqualified public tables resolve.
 
 `ALLOWED_SCHEMAS`, `ALLOWED_TABLES`, and `ALLOWED_COLUMNS` constrain structured
 discovery and mutation tools. Raw SELECT table access is not inferred from SQL
