@@ -22,11 +22,11 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "mssql": "^11.0.1",
+    "mssql": "^12.7.13",
     "dotenv": "^16.4.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/mssql": "^9.1.5"
+    "@types/mssql": "^12.3.0"
   }
 }
