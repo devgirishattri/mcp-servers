@@ -22,7 +22,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "dotenv": "^16.4.7",
-    "mysql2": "^3.22.6"
+    "mysql2": "^3.24.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"
