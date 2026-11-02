@@ -257,7 +257,7 @@ test('T-SQL sequence and non-allowlisted function access is blocked', () => {
   );
   assert.throws(
     () => server.validateSelectQuery("SELECT BulkColumn FROM OPENROWSET(BULK 'file', SINGLE_CLOB) AS source"),
-    /not allowlisted/
+    /forbidden SQL syntax|not allowlisted/
   );
 });
 
@@ -295,4 +295,309 @@ test('database errors are normalized before returning through MCP', () => {
   );
   assert.match(result.content[0].text, /Database operation failed/);
   assert.doesNotMatch(result.content[0].text, /private|SecretTable|EREQUEST/);
+});
+
+test('execute_query rejects additional T-SQL statements that need no semicolon', () => {
+  const server = createServer();
+  for (const query of [
+    'SELECT 1 SET TEXTSIZE 2147483647',
+    'SELECT 1 BEGIN TRAN',
+    'SELECT 1 COMMIT',
+    'SELECT 1 USE master',
+    "SELECT 1 WAITFOR DELAY '00:00:05'",
+    'SELECT 1 DECLARE @x int',
+    'SELECT 1 DBCC FREEPROCCACHE',
+    'SELECT 1 KILL 55',
+    'SELECT 1 SHUTDOWN',
+    'SELECT 1 RECONFIGURE',
+    'SELECT 1 CHECKPOINT',
+    'SELECT 1 REVERT',
+    'SELECT 1 DENY SELECT ON dbo.t TO public',
+    'SELECT 1 IF 1 = 1 SELECT 2',
+    'SELECT 1 WHILE 1 = 0 BREAK',
+    'SELECT 1 RECEIVE * FROM dbo.q',
+    'SELECT 1 DISABLE TRIGGER t ON dbo.x',
+    'SELECT 1 END CONVERSATION @h',
+  ]) {
+    assert.throws(() => server.validateSelectQuery(query), /forbidden SQL syntax/, query);
+  }
+});
+
+test('execute_query still accepts ordinary SELECT syntax around the new keyword guard', () => {
+  const server = createServer({ allowedSelectFunctions: new Set(['count']) });
+  assert.doesNotThrow(() =>
+    server.validateSelectQuery(
+      'SELECT id, CASE WHEN status = 1 THEN 1 ELSE 0 END AS active FROM dbo.t ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY'
+    )
+  );
+  assert.doesNotThrow(() => server.validateSelectQuery('SELECT [set], [open], [close], "begin" FROM dbo.t'));
+  assert.doesNotThrow(() => server.validateSelectQuery("SELECT 'set use begin' AS note, count(*) FROM dbo.t"));
+  assert.doesNotThrow(() => server.validateSelectQuery('SELECT settings, opened_at, end_date FROM dbo.t'));
+});
+
+test('quoted T-SQL function names cannot bypass the function allowlist', () => {
+  const server = createServer();
+  assert.throws(() => server.validateSelectQuery('SELECT dbo.f(1)'), /not allowlisted/);
+  for (const query of [
+    'SELECT [dbo].[f](1)',
+    'SELECT dbo.[f] (1)',
+    'SELECT "dbo"."f"(1)',
+    'SELECT [f]]x](1)',
+  ]) {
+    assert.throws(() => server.validateSelectQuery(query), /Quoted function names/, query);
+  }
+  assert.doesNotThrow(() => server.validateSelectQuery("SELECT '[x](1)' AS literal_text"));
+});
+
+test('unterminated T-SQL quotes and brackets fail closed', () => {
+  const server = createServer();
+  assert.throws(() => server.validateSelectQuery("SELECT 'open"), /unterminated/);
+  assert.throws(() => server.validateSelectQuery('SELECT [open'), /unterminated/);
+  assert.throws(() => server.validateSelectQuery('SELECT "open'), /unterminated/);
+});
+
+test('identifier-preserving masking keeps quoted identifiers and blanks string literals', () => {
+  const query = "SELECT [a'b], \"c\", 'd[e]' FROM t";
+  assert.equal(
+    maskSqlLiterals(query, { preserveQuotedIdentifiers: true }),
+    `SELECT [a'b], "c", ${' '.repeat(6)} FROM t`
+  );
+  assert.equal(maskSqlLiterals('SELECT N\'\u{1F600}\' AS a, b').endsWith(' AS a, b'), true);
+});
+
+test('raw SELECT runs inside a transaction that is always rolled back', async () => {
+  const events = [];
+  const server = createServer();
+  server.getPool = async () => ({});
+  server.createTransaction = () => ({
+    async begin() {
+      events.push('BEGIN');
+    },
+    async commit() {
+      events.push('COMMIT');
+    },
+    async rollback() {
+      events.push('ROLLBACK');
+    },
+  });
+  server.createTransactionRequest = () => ({ input() {} });
+  server.executeBoundedSelect = async () => {
+    events.push('QUERY');
+    return { rows: [{ id: 1 }], fields: ['id'], truncated: false };
+  };
+
+  const result = JSON.parse((await server.executeQuery('SELECT id FROM dbo.t')).content[0].text);
+  assert.equal(result.rowCount, 1);
+  assert.deepEqual(events, ['BEGIN', 'QUERY', 'ROLLBACK']);
+
+  events.length = 0;
+  server.executeBoundedSelect = async () => {
+    events.push('QUERY');
+    throw new Error('stream failed');
+  };
+  await assert.rejects(server.executeQuery('SELECT id FROM dbo.t'), /stream failed/);
+  assert.deepEqual(events, ['BEGIN', 'QUERY', 'ROLLBACK']);
+});
+
+test('bounded SELECT enables XACT_ABORT before the caller query', async () => {
+  const server = createServer();
+  let sent;
+  const request = {
+    on() {},
+    cancel() {},
+    toReadableStream() {
+      return (async function* rows() {})();
+    },
+    query(text) {
+      sent = text;
+      return Promise.resolve({});
+    },
+  };
+  await server.executeBoundedSelect(request, 'SELECT 1 AS one');
+  assert.equal(sent, 'SET XACT_ABORT ON; SET TEXTSIZE 65536; SELECT 1 AS one');
+});
+
+test('returned mutation rows omit columns outside ALLOWED_COLUMNS', async () => {
+  const server = createServer({
+    allowWrites: true,
+    returnMutationRows: true,
+    allowedColumns: new Set(['dbo.users.id', 'dbo.users.status']),
+  });
+  server.getPool = async () => ({});
+  server.createTransaction = () => ({ async begin() {}, async commit() {}, async rollback() {} });
+  server.createTransactionRequest = () => ({
+    input() {},
+    async query(query) {
+      if (query.includes('SELECT TOP')) return { recordset: [{ target: 1 }], rowsAffected: [1] };
+      return {
+        recordset: [{ Id: 7, Status: 'inactive', password_hash: 'secret' }],
+        rowsAffected: [1],
+      };
+    },
+  });
+
+  const result = JSON.parse(
+    (
+      await server.executeUpdate('users', { status: 'inactive' }, [
+        { column: 'id', operator: 'eq', value: 7 },
+      ])
+    ).content[0].text
+  );
+  assert.deepEqual(result.updated, [{ Id: 7, Status: 'inactive' }]);
+});
+
+test('RETURN_MUTATION_ROWS requires positive affected-row and response limits', async () => {
+  for (const [key, label] of [
+    ['MAX_AFFECTED_ROWS', /positive MAX_AFFECTED_ROWS/],
+    ['MAX_RESPONSE_BYTES', /positive MAX_RESPONSE_BYTES/],
+  ]) {
+    await withEnvironment(
+      { DB_USER: 'mcp_ro', RETURN_MUTATION_ROWS: 'true', [key]: '0', DB_HOST: undefined },
+      () => {
+        assert.throws(() => new MSSQLMCPServer(), label);
+      }
+    );
+  }
+});
+
+test('insecure SQL Server transport is refused for non-loopback hosts unless explicitly allowed', async () => {
+  const server = createServer();
+  await withEnvironment(
+    { DB_USER: 'mcp_ro', DB_HOST: 'db.example', DB_TRUST_SERVER_CERTIFICATE: 'true', ALLOW_INSECURE_TLS: undefined },
+    () => {
+      assert.throws(() => server.buildConnectionConfig(), /DB_TRUST_SERVER_CERTIFICATE=true .* ALLOW_INSECURE_TLS/);
+    }
+  );
+  await withEnvironment(
+    { DB_USER: 'mcp_ro', DB_HOST: 'db.example', DB_ENCRYPT: 'false', DB_TRUST_SERVER_CERTIFICATE: undefined, ALLOW_INSECURE_TLS: undefined },
+    () => {
+      assert.throws(() => server.buildConnectionConfig(), /DB_ENCRYPT=false/);
+    }
+  );
+  await withEnvironment(
+    { DB_USER: 'mcp_ro', DB_HOST: 'db.example', DB_TRUST_SERVER_CERTIFICATE: 'true', ALLOW_INSECURE_TLS: 'true' },
+    () => {
+      assert.equal(server.buildConnectionConfig().options.trustServerCertificate, true);
+    }
+  );
+  await withEnvironment(
+    { DB_USER: 'mcp_ro', DB_HOST: '127.0.0.1', DB_TRUST_SERVER_CERTIFICATE: 'true', ALLOW_INSECURE_TLS: undefined },
+    () => {
+      assert.equal(server.buildConnectionConfig().options.trustServerCertificate, true);
+    }
+  );
+});
+
+test('privilege verification covers views, server permissions, and write-mode exceptions', async () => {
+  let sentQuery = '';
+  const poolWith = (row) => ({
+    request: () => ({
+      async query(text) {
+        sentQuery = text;
+        return { recordset: [row] };
+      },
+    }),
+  });
+  const reader = createServer({ mode: 'read', verifyDbPrivileges: true });
+  await assert.doesNotReject(reader.verifyConnectionSecurity(poolWith({ is_sysadmin: 0, can_shutdown: null })));
+  assert.match(sentQuery, /HAS_PERMS_BY_NAME\(NULL, NULL, 'CONTROL SERVER'\)/);
+  assert.doesNotMatch(sentQuery, /'SERVER', 'CONTROL SERVER'/);
+  assert.match(sentQuery, /candidate\.type IN \('U', 'V', 'SN'\)/);
+  await assert.rejects(
+    reader.verifyConnectionSecurity(poolWith({ has_object_write_permission: 1 })),
+    /has_object_write_permission/
+  );
+  await assert.rejects(
+    reader.verifyConnectionSecurity(poolWith({ can_alter_any_connection: 1 })),
+    /can_alter_any_connection/
+  );
+
+  const writer = createServer({ mode: 'write', verifyDbPrivileges: true });
+  await assert.doesNotReject(
+    writer.verifyConnectionSecurity(
+      poolWith({ has_object_write_permission: 1, has_database_write_permission: 1, has_sequence_write_permission: 1 })
+    )
+  );
+  await assert.rejects(
+    writer.verifyConnectionSecurity(poolWith({ has_object_alter_permission: 1 })),
+    /has_object_alter_permission/
+  );
+});
+
+test('stored procedure output is bounded while the procedure runs to completion', async () => {
+  const { EventEmitter } = await import('node:events');
+  const server = createServer({ maxRows: 2, maxFieldBytes: 20 });
+  const request = new EventEmitter();
+  request.cancel = () => {
+    throw new Error('should not cancel');
+  };
+  request.execute = async () => {
+    request.emit('recordset', { id: {}, note: {} });
+    for (let id = 1; id <= 5; id += 1) {
+      request.emit('row', { id, note: id === 2 ? 'x'.repeat(50) : 'ok' });
+    }
+    return { output: { total: 5 }, returnValue: 0, rowsAffected: [5] };
+  };
+
+  const result = await server.executeBoundedProcedure(request, 'dbo.listUsers');
+  assert.equal(request.stream, true);
+  assert.equal(result.rowCount, 2);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(result.recordsets, [
+    [
+      { id: 1, note: 'ok' },
+      { id: 2, note: '[omitted: field exceeds MAX_FIELD_BYTES]' },
+    ],
+  ]);
+  assert.deepEqual(result.output, { total: 5 });
+
+  const failing = new EventEmitter();
+  failing.execute = async () => {
+    failing.emit('error', new Error('procedure failed'));
+    return {};
+  };
+  await assert.rejects(server.executeBoundedProcedure(failing, 'dbo.fail'), /procedure failed/);
+
+  const wide = new EventEmitter();
+  let cancelled = false;
+  wide.cancel = () => {
+    cancelled = true;
+  };
+  wide.execute = async () => {
+    wide.emit('recordset', Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`c${i}`, {}])));
+    return {};
+  };
+  await assert.rejects(server.executeBoundedProcedure(wide, 'dbo.wide'), /MAX_COLUMNS/);
+  assert.equal(cancelled, true);
+});
+
+test('failed audited tool calls emit an audit event without values', async () => {
+  const server = createServer({ allowArbitrarySelect: false });
+  const handlers = [];
+  server.server = {
+    setRequestHandler(_schema, handler) {
+      handlers.push(handler);
+    },
+  };
+  server.setupToolHandlers();
+  const callTool = handlers[1];
+  const logged = [];
+  const originalError = console.error;
+  console.error = (message) => logged.push(message);
+  try {
+    await withEnvironment({ AUDIT_LOG: undefined }, async () => {
+      const result = await callTool({
+        params: { name: 'execute_query', arguments: { query: "SELECT 'secret-value'" } },
+      });
+      assert.equal(result.isError, true);
+    });
+  } finally {
+    console.error = originalError;
+  }
+  const event = JSON.parse(logged.find((line) => line.startsWith('[MCP Audit]')).slice('[MCP Audit] '.length));
+  assert.equal(event.category, 'tool_failure');
+  assert.equal(event.operation, 'execute_query');
+  assert.equal(event.errorType, 'policy');
+  assert.match(event.reference, /^[0-9a-f-]{36}$/);
+  assert.doesNotMatch(JSON.stringify(event), /secret-value/);
 });

@@ -50,6 +50,7 @@ when it starts the process. No `.env` file needs to be created in this project;
 | `DB_SEARCH_PATH` | Comma-separated schema search path; pg_catalog is always kept first | `pg_catalog` |
 | `DB_SSL_MODE` | `disable`, `require`, or `verify-full` | Local: `disable`; remote: `verify-full` |
 | `DB_SSL_CA_FILE` | Optional CA file for `verify-full`; relative paths resolve from this directory | Node.js runtime-default CA trust |
+| `ALLOW_INSECURE_TLS` | Permit `disable` or `require` for a non-loopback `DB_HOST` | `false` |
 | `MAX_CONNECTIONS` | Maximum pooled connections | `10` |
 | `CONNECTION_TIMEOUT_MS` | Connection timeout in milliseconds | `10000` |
 | `STATEMENT_TIMEOUT_MS` | Statement timeout; `0` disables it | `30000` |
@@ -70,11 +71,11 @@ when it starts the process. No `.env` file needs to be created in this project;
 | `ALLOWED_SELECT_FUNCTIONS` | Lowercase functions permitted in optional raw SELECT queries; qualified calls require `schema.function` | Empty |
 | `ALLOW_WRITES` | Expose and enable insert/update tools | `false` |
 | `ALLOW_DELETE` | Expose and enable delete; also requires `ALLOW_WRITES=true` | `false` |
-| `RETURN_MUTATION_ROWS` | Return full changed rows; otherwise return counts only | `false` |
-| `AUDIT_LOG` | Emit value-free mutation audit events to stderr | `true` |
+| `RETURN_MUTATION_ROWS` | Return changed rows, limited to `ALLOWED_COLUMNS` when set; requires positive `MAX_AFFECTED_ROWS` and `MAX_RESPONSE_BYTES` | `false` |
+| `AUDIT_LOG` | Emit value-free audit events to stderr for mutations, raw queries, and failed raw-query or mutation calls; a warning is logged at startup when disabled | `true` |
 | `DEBUG` | Log non-secret connection details | `false` |
 
-`DB_SSL_MODE=require` encrypts traffic without verifying the server certificate. Use `verify-full` for production verification, optionally with `DB_SSL_CA_FILE`. The legacy `DB_SSL=true` setting remains equivalent to `require` when `DB_SSL_MODE` is unset.
+`DB_SSL_MODE=require` encrypts traffic without verifying the server certificate. Use `verify-full` for production verification, optionally with `DB_SSL_CA_FILE`. The legacy `DB_SSL=true` setting remains equivalent to `require` when `DB_SSL_MODE` is unset. For a non-loopback `DB_HOST`, `disable` and `require` (including `DB_SSL=true`) are refused at startup unless `ALLOW_INSECURE_TLS=true` is set.
 
 ### Database role
 
@@ -120,6 +121,7 @@ current environment-variable allowlist.
 Write tools require a separate `MCP_MODE=write` deployment plus
 `ALLOW_WRITES=true`. Delete additionally requires `ALLOW_DELETE=true`. Every
 mutation tool request requires `confirm: true` after explicit user approval.
+The `confirm` argument is filled in by the calling model, so it guards against accidental calls but is not proof that a person approved the change. Real approval has to come from the MCP host: keep write tools on manual, per-call approval and never auto-approve them.
 
 ### Structured Filters
 
@@ -159,8 +161,8 @@ The query validator is defense in depth, not a replacement for database permissi
 
 ## TLS Modes
 
-- `disable`: Do not use TLS.
-- `require`: Encrypt without certificate verification.
+- `disable`: Do not use TLS. Loopback hosts only, unless `ALLOW_INSECURE_TLS=true`.
+- `require`: Encrypt without certificate verification. Loopback hosts only, unless `ALLOW_INSECURE_TLS=true`.
 - `verify-full`: Verify the certificate chain and the DNS or IP identity in `DB_HOST` using Node.js runtime-default CA trust or `DB_SSL_CA_FILE`.
 
 ## Claude Code Integration
@@ -184,7 +186,6 @@ claude mcp add postgresql -s local \
   -e DB_NAME=your_database \
   -e DB_USER=mcp_ro \
   -e "DB_PASSWORD=$POSTGRES_MCP_PASSWORD" \
-  -e DB_SSL_MODE=disable \
   -- node /absolute/path/to/mcp-servers/database/psql-mcp/index.js
 
 unset POSTGRES_MCP_PASSWORD
@@ -221,7 +222,6 @@ codex mcp add postgresql \
   --env DB_NAME=your_database \
   --env DB_USER=mcp_ro \
   --env "DB_PASSWORD=$POSTGRES_MCP_PASSWORD" \
-  --env DB_SSL_MODE=disable \
   -- node /absolute/path/to/mcp-servers/database/psql-mcp/index.js
 
 unset POSTGRES_MCP_PASSWORD

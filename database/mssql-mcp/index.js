@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import sql from "mssql";
 import dotenv from "dotenv";
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join, resolve } from 'path';
 import {
@@ -17,11 +18,16 @@ import {
   allowedColumnNames,
   assertAllowedFunctions,
   assertInputBudget,
+  assertInsecureTransportAllowed,
+  auditEvent,
   auditMutation,
+  auditToolFailure,
   createSafeErrorResult,
   createLimitedLineInput,
   createJsonResult as createSharedJsonResult,
   FILTERS_INPUT_SCHEMA,
+  filterAllowedColumns,
+  isLoopbackHost,
   parseCsvSet,
   parseNonNegativeInteger as parseSharedNonNegativeInteger,
   parsePositiveInteger as parseSharedPositiveInteger,
@@ -29,6 +35,7 @@ import {
   validateDataObject as validateSharedDataObject,
   validateFilters as validateSharedFilters,
   validateIdentifier as validateSharedIdentifier,
+  warnIfAuditDisabled,
 } from '../shared/security.js';
 
 // Get the directory of this script
@@ -53,53 +60,184 @@ if (result.error) {
 }
 
 const PARAMETER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const FORBIDDEN_SQL_PATTERN = /(;|--|\/\*|\*\/|\b(insert|update|delete|merge|drop|alter|create|truncate|exec|execute|grant|revoke|backup|restore|into)\b)/i;
+// T-SQL does not require semicolons between statements, so every statement-leading keyword that
+// cannot appear inside a single SELECT is rejected, not just DML and DDL. Reserved words among
+// these cannot be bare identifiers, so legitimate SELECT text never contains them unquoted.
+const FORBIDDEN_SQL_PATTERN = new RegExp(
+  [
+    ';',
+    '--',
+    '\\/\\*',
+    '\\*\\/',
+    '\\b(?:' +
+      [
+        'insert', 'update', 'delete', 'merge', 'drop', 'alter', 'create', 'truncate',
+        'exec', 'execute', 'grant', 'revoke', 'deny', 'backup', 'restore', 'into', 'bulk',
+        'set', 'use', 'begin', 'commit', 'rollback', 'save', 'tran', 'transaction',
+        'declare', 'if', 'while', 'return', 'goto', 'break', 'continue', 'waitfor',
+        'print', 'raiserror', 'throw', 'dbcc', 'kill', 'shutdown', 'reconfigure',
+        'checkpoint', 'open', 'close', 'deallocate', 'revert', 'setuser', 'readtext',
+        'writetext', 'updatetext', 'add', 'receive',
+      ].join('|') +
+      ')\\b',
+    '\\b(?:enable|disable)\\s+trigger\\b',
+    '\\b(?:send|move|get|end)\\s+conversation\\b',
+    '\\bsend\\s+on\\b',
+  ].join('|'),
+  'i'
+);
+const SERVER_ROLES = [
+  'sysadmin', 'securityadmin', 'serveradmin', 'setupadmin', 'processadmin', 'diskadmin',
+  'dbcreator', 'bulkadmin',
+];
+const DATABASE_ROLES = [
+  'db_owner', 'db_ddladmin', 'db_datawriter', 'db_securityadmin', 'db_accessadmin',
+  'db_backupoperator',
+];
+// HAS_PERMS_BY_NAME(NULL, NULL, ...) is the documented form for server-level permissions.
+const SERVER_PERMISSIONS = {
+  has_server_control: 'CONTROL SERVER',
+  can_alter_any_login: 'ALTER ANY LOGIN',
+  can_alter_any_connection: 'ALTER ANY CONNECTION',
+  can_alter_settings: 'ALTER SETTINGS',
+  can_shutdown: 'SHUTDOWN',
+  can_alter_any_database: 'ALTER ANY DATABASE',
+  can_administer_bulk_operations: 'ADMINISTER BULK OPERATIONS',
+  can_impersonate_any_login: 'IMPERSONATE ANY LOGIN',
+  can_alter_any_linked_server: 'ALTER ANY LINKED SERVER',
+  can_alter_any_credential: 'ALTER ANY CREDENTIAL',
+};
+const DATABASE_PERMISSIONS = {
+  has_database_control: 'CONTROL',
+  can_alter_database: 'ALTER',
+  can_alter_any_schema: 'ALTER ANY SCHEMA',
+  can_alter_any_user: 'ALTER ANY USER',
+  can_alter_any_role: 'ALTER ANY ROLE',
+  can_create_table: 'CREATE TABLE',
+  can_create_view: 'CREATE VIEW',
+  can_create_procedure: 'CREATE PROCEDURE',
+  can_create_function: 'CREATE FUNCTION',
+  can_create_schema: 'CREATE SCHEMA',
+  can_backup_database: 'BACKUP DATABASE',
+  has_database_write_permission: ['INSERT', 'UPDATE', 'DELETE'],
+};
+const objectPermissionCheck = (alias, types, permissions) => `
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM sys.objects AS candidate
+          WHERE candidate.type IN (${types.map((type) => `'${type}'`).join(', ')})
+            AND candidate.is_ms_shipped = 0
+            AND (${permissions
+              .map(
+                (permission) => `HAS_PERMS_BY_NAME(
+              QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name),
+              'OBJECT',
+              '${permission}'
+            ) = 1`
+              )
+              .join('\n            OR ')})
+        ) THEN 1 ELSE 0 END AS ${alias}`;
+const PRIVILEGE_QUERY = `
+      SELECT
+        ${SERVER_ROLES.map((role) => `IS_SRVROLEMEMBER('${role}') AS is_${role}`).join(',\n        ')},
+        ${DATABASE_ROLES.map((role) => `IS_MEMBER('${role}') AS is_${role}`).join(',\n        ')},
+        ${Object.entries(SERVER_PERMISSIONS)
+          .map(([alias, permission]) => `HAS_PERMS_BY_NAME(NULL, NULL, '${permission}') AS ${alias}`)
+          .join(',\n        ')},
+        ${Object.entries(DATABASE_PERMISSIONS)
+          .map(([alias, permission]) => {
+            const permissions = Array.isArray(permission) ? permission : [permission];
+            const checks = permissions.map(
+              (name) => `HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', '${name}') = 1`
+            );
+            return `CASE WHEN ${checks.join(' OR ')} THEN 1 ELSE 0 END AS ${alias}`;
+          })
+          .join(',\n        ')},
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM sys.schemas AS candidate
+          WHERE candidate.schema_id < 16384
+            AND candidate.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest')
+            AND (
+              HAS_PERMS_BY_NAME(QUOTENAME(candidate.name), 'SCHEMA', 'ALTER') = 1
+              OR HAS_PERMS_BY_NAME(QUOTENAME(candidate.name), 'SCHEMA', 'TAKE OWNERSHIP') = 1
+            )
+        ) THEN 1 ELSE 0 END AS has_schema_alter_permission,
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM sys.database_principals AS candidate
+          WHERE candidate.principal_id <> DATABASE_PRINCIPAL_ID()
+            AND candidate.type IN ('S', 'U', 'G', 'E', 'X', 'C', 'K')
+            AND HAS_PERMS_BY_NAME(QUOTENAME(candidate.name), 'USER', 'IMPERSONATE') = 1
+        ) THEN 1 ELSE 0 END AS can_impersonate_user,
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM sys.server_principals AS candidate
+          WHERE candidate.principal_id <> SUSER_ID()
+            AND candidate.type IN ('S', 'U', 'G', 'E', 'X', 'C', 'K')
+            AND HAS_PERMS_BY_NAME(QUOTENAME(candidate.name), 'LOGIN', 'IMPERSONATE') = 1
+        ) THEN 1 ELSE 0 END AS can_impersonate_login,${objectPermissionCheck(
+          'has_object_write_permission',
+          ['U', 'V', 'SN'],
+          ['INSERT', 'UPDATE', 'DELETE']
+        )},${objectPermissionCheck(
+          'has_object_alter_permission',
+          ['U', 'V', 'SN'],
+          ['ALTER', 'TAKE OWNERSHIP']
+        )},${objectPermissionCheck(
+          'has_sequence_write_permission',
+          ['SO'],
+          ['UPDATE', 'ALTER']
+        )}
+    `;
+const CONFIRM_DESCRIPTION =
+  'Set to true only after the user has approved this exact change. This flag is supplied by the ' +
+  'caller and is not proof of approval; keep this tool on manual approval in the MCP client.';
+// Write deployments legitimately hold DML on their target objects.
+const WRITE_MODE_PRIVILEGES = new Set([
+  'has_object_write_permission',
+  'has_database_write_permission',
+  'has_sequence_write_permission',
+]);
+// A quoted identifier followed by "(" is a function call that the allowlist cannot see once
+// quoted text is masked, so quoted function names are rejected outright.
+const QUOTED_FUNCTION_PATTERN = /(?:\[(?:\]\]|[^\]])*\]|"(?:""|[^"])*")\s*\(/;
 
-function maskSqlLiterals(query) {
+function maskSqlLiterals(query, { preserveQuotedIdentifiers = false } = {}) {
+  // Index by UTF-16 code unit on both sides so masking stays aligned with the input.
   const characters = query.split('');
   const blankCharacter = (index) => {
     characters[index] = query[index] === '\n' ? '\n' : ' ';
   };
 
-  for (let index = 0; index < query.length; index += 1) {
-    // Double quotes delimit identifiers with QUOTED_IDENTIFIER ON and strings when it is OFF.
-    if (query[index] === "'" || query[index] === '"') {
-      const quote = query[index];
-      blankCharacter(index);
-      index += 1;
-
-      while (index < query.length) {
-        blankCharacter(index);
-        if (query[index] === quote) {
-          if (query[index + 1] === quote) {
-            index += 1;
-            blankCharacter(index);
-          } else {
-            break;
-          }
+  const skipQuoted = (start, closing, preserve) => {
+    let index = start;
+    if (!preserve) blankCharacter(index);
+    index += 1;
+    while (index < query.length) {
+      if (!preserve) blankCharacter(index);
+      if (query[index] === closing) {
+        if (query[index + 1] === closing) {
+          index += 1;
+          if (!preserve) blankCharacter(index);
+        } else {
+          return index;
         }
-        index += 1;
       }
-      continue;
+      index += 1;
     }
+    throw new Error('Query contains an unterminated quoted literal or identifier.');
+  };
 
-    // T-SQL bracketed identifiers escape a closing bracket as ]].
-    if (query[index] === '[') {
-      blankCharacter(index);
-      index += 1;
-
-      while (index < query.length) {
-        blankCharacter(index);
-        if (query[index] === ']') {
-          if (query[index + 1] === ']') {
-            index += 1;
-            blankCharacter(index);
-          } else {
-            break;
-          }
-        }
-        index += 1;
-      }
+  for (let index = 0; index < query.length; index += 1) {
+    if (query[index] === "'") {
+      index = skipQuoted(index, "'", false);
+    } else if (query[index] === '"') {
+      // Double quotes delimit identifiers with QUOTED_IDENTIFIER ON and strings when it is OFF.
+      index = skipQuoted(index, '"', preserveQuotedIdentifiers);
+    } else if (query[index] === '[') {
+      // T-SQL bracketed identifiers escape a closing bracket as ]].
+      index = skipQuoted(index, ']', preserveQuotedIdentifiers);
     }
   }
 
@@ -181,6 +319,12 @@ class MSSQLMCPServer {
       262144,
       'MAX_REQUEST_BYTES'
     );
+    if (this.returnMutationRows && this.maxAffectedRows === 0) {
+      throw new Error('RETURN_MUTATION_ROWS=true requires a positive MAX_AFFECTED_ROWS limit.');
+    }
+    if (this.returnMutationRows && this.maxResponseBytes === 0) {
+      throw new Error('RETURN_MUTATION_ROWS=true requires a positive MAX_RESPONSE_BYTES limit.');
+    }
 
     this.server = new Server(
       {
@@ -212,7 +356,17 @@ class MSSQLMCPServer {
     }
 
     const server = process.env.DB_HOST || 'localhost';
-    const localServer = ['localhost', '127.0.0.1', '::1'].includes(server.toLowerCase());
+    const localServer = isLoopbackHost(server);
+    const encrypt = process.env.DB_ENCRYPT !== 'false';
+    const trustServerCertificate = process.env.DB_TRUST_SERVER_CERTIFICATE === undefined
+      ? localServer
+      : process.env.DB_TRUST_SERVER_CERTIFICATE === 'true';
+    if (!encrypt) {
+      assertInsecureTransportAllowed(server, 'DB_ENCRYPT=false');
+    }
+    if (trustServerCertificate) {
+      assertInsecureTransportAllowed(server, 'DB_TRUST_SERVER_CERTIFICATE=true');
+    }
     const config = {
       user,
       password: process.env.DB_PASSWORD || '',
@@ -228,10 +382,8 @@ class MSSQLMCPServer {
         acquireTimeoutMillis: 2000,
       },
       options: {
-        encrypt: process.env.DB_ENCRYPT !== 'false',
-        trustServerCertificate: process.env.DB_TRUST_SERVER_CERTIFICATE === undefined
-          ? localServer
-          : process.env.DB_TRUST_SERVER_CERTIFICATE === 'true',
+        encrypt,
+        trustServerCertificate,
         enableArithAbort: true,
       },
     };
@@ -341,6 +493,10 @@ class MSSQLMCPServer {
       throw new Error('Only SELECT queries are allowed with execute_query. Use specific tools for INSERT, UPDATE, DELETE.');
     }
 
+    const identifierQuery = maskSqlLiterals(trimmedQuery, { preserveQuotedIdentifiers: true });
+    if (QUOTED_FUNCTION_PATTERN.test(identifierQuery)) {
+      throw new Error('Quoted function names are not permitted in raw SELECT queries.');
+    }
     const maskedQuery = maskSqlLiterals(trimmedQuery);
     if (FORBIDDEN_SQL_PATTERN.test(maskedQuery)) {
       throw new Error('Query contains forbidden SQL syntax.');
@@ -413,63 +569,23 @@ class MSSQLMCPServer {
     return createSharedJsonResult(payload, this.maxResponseBytes);
   }
 
-  createErrorResult(error) {
-    return createSafeErrorResult(error, this.maxResponseBytes, debugLog);
+  createErrorResult(error, errorId = randomUUID()) {
+    return createSafeErrorResult(error, this.maxResponseBytes, debugLog, errorId);
+  }
+
+  projectReturnedRows(schemaName, tableName, rows) {
+    return filterAllowedColumns(schemaName, tableName, rows, this.allowedColumns);
   }
 
   async verifyConnectionSecurity(pool) {
     if (!this.verifyDbPrivileges) {
       return;
     }
-    const result = await pool.request().query(`
-      SELECT
-        IS_SRVROLEMEMBER('sysadmin') AS is_sysadmin,
-        IS_MEMBER('db_owner') AS is_db_owner,
-        IS_MEMBER('db_ddladmin') AS is_db_ddladmin,
-        IS_MEMBER('db_datawriter') AS is_db_datawriter,
-        HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS has_database_control,
-        HAS_PERMS_BY_NAME(NULL, 'SERVER', 'CONTROL SERVER') AS has_server_control,
-        CASE WHEN EXISTS (
-          SELECT 1
-          FROM sys.tables AS candidate
-          WHERE HAS_PERMS_BY_NAME(
-            QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name),
-            'OBJECT',
-            'INSERT'
-          ) = 1
-          OR HAS_PERMS_BY_NAME(
-            QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name),
-            'OBJECT',
-            'UPDATE'
-          ) = 1
-          OR HAS_PERMS_BY_NAME(
-            QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name),
-            'OBJECT',
-            'DELETE'
-          ) = 1
-        ) THEN 1 ELSE 0 END AS has_table_write_permission,
-        CASE WHEN EXISTS (
-          SELECT 1
-          FROM sys.sequences AS candidate
-          WHERE HAS_PERMS_BY_NAME(
-            QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name),
-            'OBJECT',
-            'UPDATE'
-          ) = 1
-          OR HAS_PERMS_BY_NAME(
-            QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name),
-            'OBJECT',
-            'ALTER'
-          ) = 1
-        ) THEN 1 ELSE 0 END AS has_sequence_write_permission
-    `);
+    const result = await pool.request().query(PRIVILEGE_QUERY);
     const privileges = result.recordset?.[0] || {};
-    const unsafe = this.mode === 'write'
-      ? Object.entries(privileges).filter(([name, enabled]) =>
-          !['has_table_write_permission', 'has_sequence_write_permission'].includes(name) &&
-          Number(enabled) === 1
-        )
-      : Object.entries(privileges).filter(([, enabled]) => Number(enabled) === 1);
+    const unsafe = Object.entries(privileges).filter(([name, enabled]) =>
+      Number(enabled) === 1 && !(this.mode === 'write' && WRITE_MODE_PRIVILEGES.has(name))
+    );
     if (unsafe.length > 0) {
       throw new Error(
         `Database login has unsafe privileges: ${unsafe.map(([name]) => name).join(', ')}.`
@@ -614,7 +730,7 @@ class MSSQLMCPServer {
               },
               confirm: {
                 type: "boolean",
-                description: "Must be true after explicit user approval",
+                description: CONFIRM_DESCRIPTION,
               },
             },
             required: ["table", "data", "confirm"],
@@ -643,7 +759,7 @@ class MSSQLMCPServer {
               },
               confirm: {
                 type: "boolean",
-                description: "Must be true after explicit user approval",
+                description: CONFIRM_DESCRIPTION,
               },
             },
             required: ["table", "data", "filters", "confirm"],
@@ -672,7 +788,7 @@ class MSSQLMCPServer {
               },
               confirm: {
                 type: "boolean",
-                description: "Must be true after explicit user approval",
+                description: CONFIRM_DESCRIPTION,
               },
             },
             required: ["table", "filters", "confirm"],
@@ -705,7 +821,7 @@ class MSSQLMCPServer {
               },
               confirm: {
                 type: "boolean",
-                description: "Must be true after explicit user approval",
+                description: CONFIRM_DESCRIPTION,
               },
             },
             required: ["procedure_name", "confirm"],
@@ -769,7 +885,9 @@ class MSSQLMCPServer {
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {
-        return this.createErrorResult(error);
+        const errorId = randomUUID();
+        auditToolFailure('mssql', name, error, errorId);
+        return this.createErrorResult(error, errorId);
       }
     });
   }
@@ -783,21 +901,31 @@ class MSSQLMCPServer {
     }
 
     const pool = await this.getPool();
-    const request = pool.request();
+    const transaction = this.createTransaction(pool);
+    await transaction.begin();
+    try {
+      const request = this.createTransactionRequest(transaction);
+      this.addParameters(request, parameters);
+      const { rows: recordset, truncated, fields } = await this.executeBoundedSelect(
+        request,
+        query
+      );
 
-    this.addParameters(request, parameters);
-    const { rows: recordset, truncated, fields } = await this.executeBoundedSelect(
-      request,
-      query
-    );
-
-    return this.createJsonResult({
-      recordsets: [recordset],
-      recordset,
-      fields,
-      rowCount: recordset?.length ?? 0,
-      truncated,
-    });
+      auditEvent('mssql', 'raw_query', 'execute_query', {
+        rowCount: recordset?.length ?? 0,
+        truncated,
+      });
+      return this.createJsonResult({
+        recordsets: [recordset],
+        recordset,
+        fields,
+        rowCount: recordset?.length ?? 0,
+        truncated,
+      });
+    } finally {
+      // Raw SELECT never commits, so anything the batch changed is discarded.
+      await this.rollbackTransactionQuietly(transaction);
+    }
   }
 
   async executeBoundedSelect(request, query) {
@@ -816,7 +944,9 @@ class MSSQLMCPServer {
       }
     });
 
-    const completion = request.query(`SET TEXTSIZE ${this.maxFieldBytes}; ${query}`);
+    const completion = request.query(
+      `SET XACT_ABORT ON; SET TEXTSIZE ${this.maxFieldBytes}; ${query}`
+    );
     try {
       for await (const row of readable) {
         if (rows.length >= this.maxRows) {
@@ -1002,7 +1132,9 @@ class MSSQLMCPServer {
 
     auditMutation('mssql', 'insert', { schema: schemaName, table, rowsAffected: result.rowsAffected[0] });
     return this.createJsonResult({
-      inserted: this.returnMutationRows ? result.recordset : undefined,
+      inserted: this.returnMutationRows
+        ? this.projectReturnedRows(schemaName, table, result.recordset)
+        : undefined,
       rowsAffected: result.rowsAffected[0],
       rowCount: result.rowsAffected[0],
     });
@@ -1092,7 +1224,9 @@ class MSSQLMCPServer {
       transactionStarted = false;
       auditMutation('mssql', 'update', { schema: schemaName, table, rowsAffected });
       return this.createJsonResult({
-        updated: this.returnMutationRows ? result.recordset : undefined,
+        updated: this.returnMutationRows
+          ? this.projectReturnedRows(schemaName, table, result.recordset)
+          : undefined,
         rowsAffected,
         rowCount: rowsAffected,
       });
@@ -1142,7 +1276,9 @@ class MSSQLMCPServer {
       transactionStarted = false;
       auditMutation('mssql', 'delete', { schema: schemaName, table, rowsAffected });
       return this.createJsonResult({
-        deleted: this.returnMutationRows ? result.recordset : undefined,
+        deleted: this.returnMutationRows
+          ? this.projectReturnedRows(schemaName, table, result.recordset)
+          : undefined,
         rowsAffected,
         rowCount: rowsAffected,
       });
@@ -1170,17 +1306,103 @@ class MSSQLMCPServer {
       request.input(key, value);
     }
 
-    const result = await request.execute(`${schemaName}.${procedureName}`);
+    const result = await this.executeBoundedProcedure(request, `${schemaName}.${procedureName}`);
 
-    auditMutation('mssql', 'stored_procedure', { schema: schemaName, procedure: procedureName });
+    auditMutation('mssql', 'stored_procedure', {
+      schema: schemaName,
+      procedure: procedureName,
+      rowCount: result.rowCount,
+      truncated: result.truncated,
+    });
     return this.createJsonResult({
       recordsets: result.recordsets,
-      recordset: result.recordset,
+      recordset: result.recordsets[0] ?? [],
       output: result.output,
       returnValue: result.returnValue,
       rowsAffected: result.rowsAffected,
-      rowCount: result.recordset?.length ?? 0,
+      rowCount: result.rowCount,
+      truncated: result.truncated,
     });
+  }
+
+  limitFieldSizes(row) {
+    const limited = {};
+    for (const [column, value] of Object.entries(row || {})) {
+      let serialized;
+      try {
+        serialized = JSON.stringify(value);
+      } catch {
+        serialized = JSON.stringify(String(value));
+      }
+      limited[column] = Buffer.byteLength(serialized ?? '', 'utf8') > this.maxFieldBytes
+        ? '[omitted: field exceeds MAX_FIELD_BYTES]'
+        : value;
+    }
+    return limited;
+  }
+
+  // Streams procedure output and keeps only rows within MAX_ROWS and MAX_RESPONSE_BYTES. The
+  // procedure is allowed to finish (it is not cancelled midway), but excess rows are discarded.
+  async executeBoundedProcedure(request, procedure) {
+    request.stream = true;
+    const recordsets = [];
+    const errors = [];
+    let current = null;
+    let rowCount = 0;
+    let responseBytes = 256;
+    let truncated = false;
+    let columnLimitExceeded = false;
+
+    // In stream mode the driver reports failures only through 'error' events.
+    request.on('error', (error) => errors.push(error));
+    request.on('recordset', (columns) => {
+      if (Object.keys(columns || {}).length > this.maxColumns) {
+        if (!columnLimitExceeded) {
+          columnLimitExceeded = true;
+          request.cancel();
+        }
+        return;
+      }
+      current = [];
+      recordsets.push(current);
+    });
+    request.on('row', (row) => {
+      if (columnLimitExceeded || truncated) {
+        return;
+      }
+      if (!current) {
+        current = [];
+        recordsets.push(current);
+      }
+      const bounded = this.limitFieldSizes(row);
+      const rowBytes = Buffer.byteLength(JSON.stringify(bounded), 'utf8');
+      if (
+        (this.maxRows > 0 && rowCount >= this.maxRows) ||
+        (this.maxResponseBytes > 0 && responseBytes + rowBytes > this.maxResponseBytes - 512)
+      ) {
+        truncated = true;
+        return;
+      }
+      responseBytes += rowBytes;
+      rowCount += 1;
+      current.push(bounded);
+    });
+
+    const result = await request.execute(procedure);
+    if (columnLimitExceeded) {
+      throw new Error(`Stored procedure result exceeds MAX_COLUMNS (${this.maxColumns}).`);
+    }
+    if (errors.length > 0) {
+      throw errors[0];
+    }
+    return {
+      recordsets,
+      rowCount,
+      truncated,
+      output: result?.output,
+      returnValue: result?.returnValue,
+      rowsAffected: result?.rowsAffected,
+    };
   }
 
   setupErrorHandlers() {
@@ -1209,6 +1431,7 @@ class MSSQLMCPServer {
       process.stdout
     );
     await this.server.connect(transport);
+    warnIfAuditDisabled('MSSQL');
     console.error("MSSQL MCP server running on stdio");
   }
 }

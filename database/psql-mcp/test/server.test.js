@@ -299,6 +299,7 @@ test("connection configuration keeps credentials structured and applies timezone
       DB_TIMEZONE: "Asia/Kolkata",
       DB_SEARCH_PATH: undefined,
       DB_SSL_MODE: "disable",
+      ALLOW_INSECURE_TLS: "true",
       MAX_CONNECTIONS: "5",
     },
     () => {
@@ -534,4 +535,143 @@ test("stdio input is rejected before an oversized JSON-RPC line reaches the SDK"
     },
     /MAX_REQUEST_BYTES/
   );
+});
+
+test("literal masking stays aligned after astral characters", () => {
+  const emoji = "\u{1F600}";
+  const query = `SELECT '${emoji.repeat(8)}' AS a, b FROM t`;
+  const masked = maskSqlLiterals(query);
+  assert.equal(masked.length, query.length);
+  assert.ok(masked.endsWith(" AS a, b FROM t"));
+  assert.equal(
+    maskSqlLiterals(`SELECT "${emoji}" , lower(x)`, { preserveQuotedIdentifiers: true }),
+    `SELECT "${emoji}" , lower(x)`
+  );
+});
+
+test("astral characters in a literal cannot hide a non-allowlisted or forbidden function", () => {
+  const emoji = "\u{1F600}";
+  const server = createServer({ forbiddenSelectFunctions: new Set(FORBIDDEN_SELECT_FUNCTIONS) });
+  assert.throws(
+    () => server.validateSelectQuery(`SELECT 1 AS k, '${emoji.repeat(8)}' = lower(name) AS m FROM t`),
+    /not allowlisted: lower/
+  );
+  const allowingSleep = createServer({
+    allowedSelectFunctions: new Set(["pg_sleep"]),
+    forbiddenSelectFunctions: new Set(FORBIDDEN_SELECT_FUNCTIONS),
+  });
+  assert.throws(
+    () => allowingSleep.validateSelectQuery(`SELECT 1 AS k, '${emoji.repeat(12)}' = pg_sleep(1)::text AS m`),
+    /forbidden function: pg_sleep/
+  );
+});
+
+test("insecure PostgreSQL TLS modes are refused for non-loopback hosts unless explicitly allowed", async () => {
+  const server = createServer();
+  for (const mode of ["disable", "require"]) {
+    await withEnvironment(
+      { DB_HOST: "db.example", DB_SSL: undefined, DB_SSL_MODE: mode, ALLOW_INSECURE_TLS: undefined },
+      () => {
+        assert.throws(() => server.buildSslConfig(), new RegExp(`DB_SSL_MODE=${mode} .* ALLOW_INSECURE_TLS`));
+      }
+    );
+  }
+  await withEnvironment(
+    { DB_HOST: "db.example", DB_SSL: "true", DB_SSL_MODE: undefined, ALLOW_INSECURE_TLS: undefined },
+    () => {
+      assert.throws(() => server.buildSslConfig(), /DB_SSL_MODE=require/);
+    }
+  );
+  await withEnvironment(
+    { DB_HOST: "db.example", DB_SSL_MODE: "require", ALLOW_INSECURE_TLS: "true" },
+    () => {
+      assert.deepEqual(server.buildSslConfig(), { rejectUnauthorized: false });
+    }
+  );
+  await withEnvironment({ DB_HOST: "127.0.0.2", DB_SSL_MODE: "disable", ALLOW_INSECURE_TLS: undefined }, () => {
+    assert.equal(server.buildSslConfig(), false);
+  });
+});
+
+test("returned mutation rows omit columns outside ALLOWED_COLUMNS", async () => {
+  const server = createServer({
+    allowWrites: true,
+    allowDelete: true,
+    returnMutationRows: true,
+    verifyDbPrivileges: false,
+    allowedColumns: new Set(["public.users.id", "public.users.status"]),
+  });
+  const returned = [{ id: 7, status: "inactive", password_hash: "secret" }];
+  server.pool = {
+    async query() {
+      return { rows: returned, rowCount: 1 };
+    },
+    async connect() {
+      return {
+        async query(text) {
+          if (typeof text === "string" && /^(UPDATE|DELETE)/.test(text)) {
+            return { rows: returned, rowCount: 1 };
+          }
+          return { rows: [{ "?column?": 1 }], rowCount: 1 };
+        },
+        release() {},
+      };
+    },
+  };
+
+  const inserted = JSON.parse(
+    (await server.executeInsert("users", { id: 7, status: "inactive" })).content[0].text
+  );
+  assert.deepEqual(inserted.inserted, { id: 7, status: "inactive" });
+  const filters = [{ column: "id", operator: "eq", value: 7 }];
+  const updated = JSON.parse(
+    (await server.executeUpdate("users", { status: "inactive" }, filters)).content[0].text
+  );
+  assert.deepEqual(updated.updated, [{ id: 7, status: "inactive" }]);
+  const deleted = JSON.parse((await server.executeDelete("users", filters)).content[0].text);
+  assert.deepEqual(deleted.deleted, [{ id: 7, status: "inactive" }]);
+});
+
+test("RETURN_MUTATION_ROWS requires positive affected-row and response limits", async () => {
+  for (const [key, label] of [
+    ["MAX_AFFECTED_ROWS", /positive MAX_AFFECTED_ROWS/],
+    ["MAX_RESPONSE_BYTES", /positive MAX_RESPONSE_BYTES/],
+  ]) {
+    await withEnvironment(
+      { DB_USER: "mcp_ro", DB_HOST: undefined, DB_SSL_MODE: undefined, RETURN_MUTATION_ROWS: "true", [key]: "0" },
+      () => {
+        assert.throws(() => new PostgreSQLMCPServer(), label);
+      }
+    );
+  }
+});
+
+test("failed audited tool calls emit an audit event without values", async () => {
+  const server = createServer({ allowArbitrarySelect: false });
+  const handlers = [];
+  server.server = {
+    setRequestHandler(_schema, handler) {
+      handlers.push(handler);
+    },
+  };
+  server.setupToolHandlers();
+  const logged = [];
+  const originalError = console.error;
+  console.error = (message) => logged.push(message);
+  try {
+    await withEnvironment({ AUDIT_LOG: undefined }, async () => {
+      const result = await handlers[1]({
+        params: { name: "execute_query", arguments: { query: "SELECT 'secret-value'" } },
+      });
+      assert.equal(result.isError, true);
+    });
+  } finally {
+    console.error = originalError;
+  }
+  const line = logged.find((entry) => entry.startsWith("[MCP Audit]"));
+  const event = JSON.parse(line.slice("[MCP Audit] ".length));
+  assert.equal(event.category, "tool_failure");
+  assert.equal(event.operation, "execute_query");
+  assert.equal(event.errorType, "policy");
+  assert.doesNotMatch(line, /secret-value/);
 });

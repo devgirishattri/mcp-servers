@@ -807,3 +807,73 @@ test("stdio input is rejected before an oversized JSON-RPC line reaches the SDK"
     /MAX_REQUEST_BYTES/
   );
 });
+
+test("literal masking stays aligned after astral characters", () => {
+  const emoji = "\u{1F600}";
+  const query = `SELECT '${emoji.repeat(8)}' AS a, b FROM t`;
+  const masked = maskSqlLiterals(query);
+  assert.equal(masked.length, query.length);
+  assert.ok(masked.endsWith(" AS a, b FROM t"));
+});
+
+test("astral characters in a literal cannot hide a non-allowlisted or forbidden function", () => {
+  const emoji = "\u{1F600}";
+  const server = createServer();
+  assert.throws(
+    () => server.validateSelectQuery(`SELECT 1 AS k, '${emoji.repeat(8)}' = lower(name) AS m FROM t`),
+    /not allowlisted: lower/
+  );
+  const allowingSleep = createServer({
+    allowedSelectFunctions: new Set(["sleep"]),
+    forbiddenSelectFunctions: new Set(["sleep"]),
+  });
+  assert.throws(
+    () => allowingSleep.validateSelectQuery(`SELECT 1 AS k, '${emoji.repeat(9)}' = sleep(1) AS m`),
+    /forbidden function: sleep/
+  );
+});
+
+test("insecure MySQL TLS modes are refused for non-loopback hosts unless explicitly allowed", async () => {
+  const server = createServer();
+  for (const mode of ["disable", "require"]) {
+    await withEnvironment({ DB_HOST: "db.example", DB_SSL_MODE: mode, ALLOW_INSECURE_TLS: undefined }, () => {
+      assert.throws(() => server.buildSslConfig(), new RegExp(`DB_SSL_MODE=${mode} .* ALLOW_INSECURE_TLS`));
+    });
+  }
+  await withEnvironment({ DB_HOST: "db.example", DB_SSL_MODE: "disable", ALLOW_INSECURE_TLS: "true" }, () => {
+    assert.equal(server.buildSslConfig(), undefined);
+  });
+  await withEnvironment({ DB_HOST: "::1", DB_SSL_MODE: "require", ALLOW_INSECURE_TLS: undefined }, () => {
+    assert.deepEqual(server.buildSslConfig(), { rejectUnauthorized: false });
+  });
+});
+
+test("failed audited tool calls emit an audit event without values", async () => {
+  const server = createServer({ allowArbitrarySelect: false });
+  const handlers = [];
+  server.server = {
+    setRequestHandler(_schema, handler) {
+      handlers.push(handler);
+    },
+  };
+  server.setupToolHandlers();
+  const logged = [];
+  const originalError = console.error;
+  console.error = (message) => logged.push(message);
+  try {
+    await withEnvironment({ AUDIT_LOG: undefined }, async () => {
+      const result = await handlers[1]({
+        params: { name: "execute_query", arguments: { query: "SELECT 'secret-value'" } },
+      });
+      assert.equal(result.isError, true);
+    });
+  } finally {
+    console.error = originalError;
+  }
+  const line = logged.find((entry) => entry.startsWith("[MCP Audit]"));
+  const event = JSON.parse(line.slice("[MCP Audit] ".length));
+  assert.equal(event.category, "tool_failure");
+  assert.equal(event.operation, "execute_query");
+  assert.equal(event.errorType, "policy");
+  assert.doesNotMatch(line, /secret-value/);
+});

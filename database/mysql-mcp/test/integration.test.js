@@ -125,6 +125,17 @@ test("live MySQL security, limits, metadata, and controlled writes", { skip: !en
           () => readServer.validateSelectQuery("SELECT LOAD_FILE('/etc/passwd')"),
           /forbidden function/
         );
+        const smiles = JSON.parse(
+          (await readServer.executeQuery("SELECT '\u{1F600}' AS smile")).content[0].text
+        );
+        assert.equal(smiles.rows[0].smile, "\u{1F600}");
+        assert.throws(
+          () =>
+            readServer.validateSelectQuery(
+              `SELECT 1 AS k, '${"\u{1F600}".repeat(8)}' = lower(note) AS m FROM sample`
+            ),
+          /not allowlisted: lower/
+        );
       }
     );
     await readServer.shutdown();

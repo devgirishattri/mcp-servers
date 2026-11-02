@@ -40,6 +40,7 @@ variable reference only.
 | `DB_TIMEZONE` | `Z`, `local`, or a numeric offset such as `+05:30` | `Z` |
 | `DB_SSL_MODE` | `disable`, `require`, or `verify-full` | Local: `disable`; remote: `verify-full` |
 | `DB_SSL_CA_FILE` | Optional CA file for `verify-full`; relative paths resolve here | Node.js runtime-default CA trust |
+| `ALLOW_INSECURE_TLS` | Permit `disable` or `require` for a non-loopback `DB_HOST` | `false` |
 | `MAX_CONNECTIONS` | Maximum pooled connections | `10` |
 | `CONNECTION_TIMEOUT_MS` | Connection timeout in milliseconds | `10000` |
 | `STATEMENT_TIMEOUT_MS` | MySQL and driver query timeout; `0` disables it | `30000` |
@@ -61,10 +62,10 @@ variable reference only.
 | `ALLOW_WRITES` | Expose insert and update tools | `false` |
 | `ALLOW_DELETE` | Expose delete; also requires `ALLOW_WRITES=true` | `false` |
 | `RETURN_MUTATION_ROWS` | Return bounded mutation snapshots; requires positive affected-row and response limits | `false` |
-| `AUDIT_LOG` | Emit value-free mutation audit events to stderr | `true` |
+| `AUDIT_LOG` | Emit value-free audit events to stderr for mutations, raw queries, and failed raw-query or mutation calls; a warning is logged at startup when disabled | `true` |
 | `DEBUG` | Log non-secret connection diagnostics | `false` |
 
-`DB_SSL_MODE=require` encrypts the connection without verifying the server certificate. Use `verify-full` for remote production databases and provide `DB_SSL_CA_FILE` when the server certificate does not chain to the system trust store.
+`DB_SSL_MODE=require` encrypts the connection without verifying the server certificate. Use `verify-full` for remote production databases and provide `DB_SSL_CA_FILE` when the server certificate does not chain to the system trust store. For a non-loopback `DB_HOST`, `disable` and `require` are refused at startup unless `ALLOW_INSECURE_TLS=true` is set.
 
 Schema, table, and column allowlists use exact-case matching. Copy object names exactly as MySQL reports them, particularly on servers where table names are case-sensitive.
 
@@ -118,7 +119,7 @@ The default read configuration exposes:
 
 `ALLOWED_COLUMNS` is incompatible with raw query mode. Use curated views for a database-enforced column boundary.
 
-A separate `MCP_MODE=write` process with `ALLOW_WRITES=true` exposes `execute_insert` and `execute_update`. `ALLOW_DELETE=true` also exposes `execute_delete`. Every mutation tool call requires `confirm: true` after explicit user approval.
+A separate `MCP_MODE=write` process with `ALLOW_WRITES=true` exposes `execute_insert` and `execute_update`. `ALLOW_DELETE=true` also exposes `execute_delete`. Every mutation tool call requires `confirm: true` after explicit user approval. The `confirm` argument is filled in by the calling model, so it guards against accidental calls but is not proof that a person approved the change. Real approval has to come from the MCP host: keep write tools on manual, per-call approval and never auto-approve them.
 
 Structured update/delete filters are joined with `AND`. Supported operators are `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `in`, `is_null`, and `is_not_null`.
 
@@ -176,7 +177,6 @@ claude mcp add mysql -s local \
   -e DB_NAME=your_database \
   -e DB_USER=mcp_ro \
   -e "DB_PASSWORD=$MYSQL_MCP_PASSWORD" \
-  -e DB_SSL_MODE=disable \
   -- node /absolute/path/to/mcp-servers/database/mysql-mcp/index.js
 
 unset MYSQL_MCP_PASSWORD
@@ -213,7 +213,6 @@ codex mcp add mysql \
   --env DB_NAME=your_database \
   --env DB_USER=mcp_ro \
   --env "DB_PASSWORD=$MYSQL_MCP_PASSWORD" \
-  --env DB_SSL_MODE=disable \
   -- node /absolute/path/to/mcp-servers/database/mysql-mcp/index.js
 
 unset MYSQL_MCP_PASSWORD
