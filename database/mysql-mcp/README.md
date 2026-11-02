@@ -54,6 +54,7 @@ variable reference only.
 | `MAX_INPUT_ITEMS` | Maximum top-level parameter, data, or filter items | `100` |
 | `MCP_MODE` | Separate deployment mode: `read` or `write` | `read` |
 | `VERIFY_DB_PRIVILEGES` | Verify direct and enabled-role grants before first database use | `true` |
+| `PRIVILEGE_RECHECK_SECONDS` | Repeat the grant check on the first tool call after this many seconds; `0` checks once per process | `300` |
 | `ALLOW_ARBITRARY_SELECT` | Expose `execute_query` | `false` |
 | `ALLOWED_SCHEMAS` | Comma-separated database allowlist | `DB_NAME` |
 | `ALLOWED_TABLES` | Optional comma-separated `database.table` allowlist | All tables in allowed databases |
@@ -99,6 +100,8 @@ At first database use, `VERIFY_DB_PRIVILEGES=true` expands the session's enabled
 - grants outside `ALLOWED_SCHEMAS` or `ALLOWED_TABLES`.
 
 The check is intentionally conservative. An account that relies on global grants plus partial revocation is rejected; grant access directly to the intended database objects instead.
+
+The check repeats every `PRIVILEGE_RECHECK_SECONDS` (default 300) on the next tool call, so a grant added while the server runs is noticed. When a repeat check fails, every tool is refused until the grants pass again.
 
 ## Available Tools
 

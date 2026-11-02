@@ -63,7 +63,8 @@ when it starts the process. No `.env` file needs to be created in this project;
 | `MAX_INPUT_BYTES` | Maximum serialized tool input/query component size | `65536` |
 | `MAX_INPUT_ITEMS` | Maximum top-level parameter, data, or filter items | `100` |
 | `MCP_MODE` | Separate deployment mode: `read` or `write` | `read` |
-| `VERIFY_DB_PRIVILEGES` | Reject unsafe effective database privileges at first use | `true` |
+| `VERIFY_DB_PRIVILEGES` | Reject unsafe effective database privileges | `true` |
+| `PRIVILEGE_RECHECK_SECONDS` | Repeat the privilege check on the first tool call after this many seconds; `0` checks once per process | `300` |
 | `ALLOW_ARBITRARY_SELECT` | Expose `execute_query`; requires read-only DB grants | `false` |
 | `ALLOWED_SCHEMAS` | Comma-separated schema allowlist for structured tools | `public` |
 | `ALLOWED_TABLES` | Optional comma-separated `schema.table` allowlist for structured tools | All tables in allowed schemas |
@@ -158,6 +159,13 @@ When explicitly enabled, `execute_query`:
 - applies a server-side field cap, fetches one row at a time through a transaction-scoped cursor, and stops before `MAX_ROWS`, `MAX_COLUMNS`, or `MAX_RESPONSE_BYTES` is exceeded.
 
 The query validator is defense in depth, not a replacement for database permissions. `VERIFY_DB_PRIVILEGES=true` rejects unsafe read-mode roles, but grants should still be restricted to the allowed schemas, tables, and functions.
+
+The privilege check also:
+
+- rejects membership in `pg_read_all_data` or `pg_write_all_data` in both modes, because those roles bypass object grants;
+- compares the tables, views, materialized views, and foreign tables the role can reach (including column-level grants) with `ALLOWED_SCHEMAS` and `ALLOWED_TABLES`. Raw SELECT is not limited by those allowlists, so when `ALLOW_ARBITRARY_SELECT=true` any reachable object outside them causes tools to be refused. With raw SELECT disabled, the structured tools still enforce the allowlists and the server only logs a warning to stderr. Objects in `pg_catalog`, `information_schema`, and other `pg_*` schemas are not counted.
+
+The check repeats every `PRIVILEGE_RECHECK_SECONDS` (default 300) on the next tool call, so a grant added while the server runs is noticed. When a repeat check fails, every tool is refused until the grants pass again.
 
 ## TLS Modes
 

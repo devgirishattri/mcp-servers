@@ -263,6 +263,63 @@ export function filterAllowedColumns(schemaName, tableName, rows, allowedColumns
   });
 }
 
+// Privilege checks repeat on the first tool call after this many seconds, so grants added
+// while the process runs are noticed. 0 verifies once per process.
+export function parsePrivilegeRecheckMs(value) {
+  return parseNonNegativeInteger(value, 300, "PRIVILEGE_RECHECK_SECONDS") * 1000;
+}
+
+export function isPrivilegeVerificationFresh(verified, verifiedAt, recheckMs, now = Date.now()) {
+  if (!verified) {
+    return false;
+  }
+  return !recheckMs || now - verifiedAt < recheckMs;
+}
+
+export function objectsOutsideAllowlist(objects, allowedSchemas, allowedTables) {
+  return objects.filter(({ schema, name }) => {
+    if (allowedSchemas.size > 0 && !allowedSchemas.has(String(schema).toLowerCase())) {
+      return true;
+    }
+    return allowedTables.size > 0 && !allowedTables.has(`${schema}.${name}`.toLowerCase());
+  });
+}
+
+const GRANT_SCOPE_SAMPLE_SIZE = 5;
+
+// Structured tools enforce ALLOWED_SCHEMAS/ALLOWED_TABLES themselves, but raw SELECT can reach
+// anything the database identity can read. Grants wider than the allowlists are therefore
+// refused when execute_query is enabled and logged as a warning otherwise. Object names go to
+// the operator's log only, never to the MCP client.
+export function enforceGrantScope(engine, objects, policy, state) {
+  const outside = objectsOutsideAllowlist(objects, policy.allowedSchemas, policy.allowedTables);
+  let summary = "";
+  if (outside.length > 0) {
+    const sample = outside
+      .slice(0, GRANT_SCOPE_SAMPLE_SIZE)
+      .map(({ schema, name }) => `${schema}.${name}`)
+      .join(", ");
+    const more = outside.length > GRANT_SCOPE_SAMPLE_SIZE ? ", ..." : "";
+    summary = `${outside.length} object(s) outside ALLOWED_SCHEMAS/ALLOWED_TABLES (${sample}${more})`;
+  }
+  if (summary && summary !== state.grantScopeSummary) {
+    console.error(
+      policy.rawSelectEnabled
+        ? `[${engine} MCP] ERROR: the database identity can access ${summary}. ` +
+            "Tools are refused until the grants or the allowlists are narrowed."
+        : `[${engine} MCP] WARNING: the database identity can access ${summary}. ` +
+            "Structured tools still enforce the allowlists, but the grants should be narrowed."
+    );
+  }
+  state.grantScopeSummary = summary;
+  if (summary && policy.rawSelectEnabled) {
+    throw new Error(
+      `Database identity can access ${outside.length} object(s) outside ALLOWED_SCHEMAS/ALLOWED_TABLES, ` +
+        "which execute_query would expose. Narrow the grants or the allowlists; the server log lists the objects."
+    );
+  }
+}
+
 const LOOPBACK_HOSTS = new Set(["localhost", "::1", "[::1]"]);
 
 export function isLoopbackHost(host) {

@@ -27,12 +27,15 @@ import {
   createSafeErrorResult,
   createLimitedLineInput,
   createJsonResult as createSharedJsonResult,
+  enforceGrantScope,
   FILTERS_INPUT_SCHEMA,
   filterAllowedColumns,
   isLoopbackHost,
+  isPrivilegeVerificationFresh,
   parseCsvSet,
   parseNonNegativeInteger as parseSharedNonNegativeInteger,
   parsePositiveInteger as parseSharedPositiveInteger,
+  parsePrivilegeRecheckMs,
   requireMutationConfirmation,
   validateDataObject as validateSharedDataObject,
   validateFilters as validateSharedFilters,
@@ -62,6 +65,21 @@ const { Pool } = pg;
 const TIMEZONE_PATTERN = /^[A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*$/;
 const SEARCH_PATH_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SYSTEM_SCHEMA_PATTERN = /^(?:information_schema|pg_catalog|pg_toast(?:_temp_\d+)?|pg_temp(?:_\d+)?)$/i;
+// Relations the role can reach through any table- or column-level privilege, excluding the
+// system schemas. Used to compare effective grants with ALLOWED_SCHEMAS/ALLOWED_TABLES.
+const ACCESSIBLE_RELATIONS_QUERY = `
+  SELECT candidate_schema.nspname AS schema_name, candidate.relname AS object_name
+  FROM pg_class AS candidate
+  JOIN pg_namespace AS candidate_schema ON candidate_schema.oid = candidate.relnamespace
+  WHERE candidate.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND candidate_schema.nspname <> 'information_schema'
+    AND candidate_schema.nspname !~ '^pg_'
+    AND (
+      has_any_column_privilege(current_user, candidate.oid, 'SELECT, INSERT, UPDATE, REFERENCES')
+      OR has_table_privilege(current_user, candidate.oid, 'DELETE, TRUNCATE, TRIGGER')
+    )
+  ORDER BY 1, 2
+`;
 const FORBIDDEN_SQL_PATTERN = /(;|--|\/\*|\*\/|\b(insert|update|delete|merge|drop|alter|create|truncate|exec|execute|grant|revoke|backup|restore|into|begin|commit|rollback|savepoint)\b)/i;
 const FORBIDDEN_SELECT_FUNCTIONS = new Set([
   "pg_read_file",
@@ -245,6 +263,7 @@ class PostgreSQLMCPServer {
     this.allowedSelectFunctions = parseCsvSet(process.env.ALLOWED_SELECT_FUNCTIONS);
     this.forbiddenSelectFunctions = new Set(FORBIDDEN_SELECT_FUNCTIONS);
     this.verifyDbPrivileges = process.env.VERIFY_DB_PRIVILEGES !== "false";
+    this.privilegeRecheckMs = parsePrivilegeRecheckMs(process.env.PRIVILEGE_RECHECK_SECONDS);
     this.maxRows = this.parseNonNegativeInteger(process.env.MAX_ROWS, 1000, "MAX_ROWS");
     this.maxAffectedRows = this.parseNonNegativeInteger(
       process.env.MAX_AFFECTED_ROWS,
@@ -313,6 +332,8 @@ class PostgreSQLMCPServer {
     this.pool = new Pool(this.buildConnectionConfig());
     this.securityVerificationPromise = null;
     this.securityVerified = false;
+    this.securityVerifiedAt = 0;
+    this.grantScopeSummary = "";
     this.setupToolHandlers();
     this.setupErrorHandlers();
   }
@@ -555,67 +576,103 @@ class PostgreSQLMCPServer {
   }
 
   async ensureSecurityVerified() {
-    if (!this.verifyDbPrivileges || this.securityVerified) {
+    if (
+      !this.verifyDbPrivileges ||
+      isPrivilegeVerificationFresh(this.securityVerified, this.securityVerifiedAt, this.privilegeRecheckMs)
+    ) {
       return;
     }
     if (!this.securityVerificationPromise) {
-      this.securityVerificationPromise = (async () => {
-        const result = await this.pool.query(`
-          SELECT
-            rolsuper,
-            rolcreaterole,
-            rolcreatedb,
-            rolreplication,
-            rolbypassrls,
-            pg_has_role(current_user, 'pg_read_server_files', 'MEMBER') AS can_read_server_files,
-            pg_has_role(current_user, 'pg_write_server_files', 'MEMBER') AS can_write_server_files,
-            pg_has_role(current_user, 'pg_execute_server_program', 'MEMBER') AS can_execute_server_program,
-            pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') AS can_signal_backend,
-            EXISTS (
-              SELECT 1
-              FROM pg_class AS candidate
-              JOIN pg_namespace AS candidate_schema ON candidate_schema.oid = candidate.relnamespace
-              WHERE candidate.relkind IN ('r', 'p', 'v', 'm', 'f')
-                AND candidate_schema.nspname NOT IN ('pg_catalog', 'information_schema')
-                AND (
-                  has_table_privilege(current_user, candidate.oid, 'INSERT')
-                  OR has_table_privilege(current_user, candidate.oid, 'UPDATE')
-                  OR has_table_privilege(current_user, candidate.oid, 'DELETE')
-                  OR has_table_privilege(current_user, candidate.oid, 'TRUNCATE')
-                  OR has_table_privilege(current_user, candidate.oid, 'TRIGGER')
-                )
-            ) AS can_write_tables,
-            EXISTS (
-              SELECT 1
-              FROM pg_class AS candidate
-              JOIN pg_namespace AS candidate_schema ON candidate_schema.oid = candidate.relnamespace
-              WHERE candidate.relkind = 'S'
-                AND candidate_schema.nspname NOT IN ('pg_catalog', 'information_schema')
-                AND (
-                  has_sequence_privilege(current_user, candidate.oid, 'USAGE')
-                  OR has_sequence_privilege(current_user, candidate.oid, 'UPDATE')
-                )
-            ) AS can_advance_sequences
-          FROM pg_roles
-          WHERE rolname = current_user
-        `);
-        const privileges = result.rows[0] || {};
-        const unsafe = this.mode === "write"
-          ? Object.entries(privileges).filter(([name, enabled]) =>
-              !["can_write_tables", "can_advance_sequences"].includes(name) && enabled === true
-            )
-          : Object.entries(privileges).filter(([, enabled]) => enabled === true);
-        if (unsafe.length > 0) {
-          throw new Error(
-            `Database role has unsafe privileges: ${unsafe.map(([name]) => name).join(", ")}.`
-          );
+      this.securityVerificationPromise = this.verifySecurity().then(
+        () => {
+          this.securityVerified = true;
+          this.securityVerifiedAt = Date.now();
+        },
+        (error) => {
+          this.securityVerified = false;
+          throw error;
         }
-        this.securityVerified = true;
-      })().finally(() => {
+      ).finally(() => {
         this.securityVerificationPromise = null;
       });
     }
     return this.securityVerificationPromise;
+  }
+
+  async verifySecurity() {
+    const result = await this.pool.query(`
+      SELECT
+        rolsuper,
+        rolcreaterole,
+        rolcreatedb,
+        rolreplication,
+        rolbypassrls,
+        pg_has_role(current_user, 'pg_read_server_files', 'MEMBER') AS can_read_server_files,
+        pg_has_role(current_user, 'pg_write_server_files', 'MEMBER') AS can_write_server_files,
+        pg_has_role(current_user, 'pg_execute_server_program', 'MEMBER') AS can_execute_server_program,
+        pg_has_role(current_user, 'pg_signal_backend', 'MEMBER') AS can_signal_backend,
+        -- pg_read_all_data and pg_write_all_data exist from PostgreSQL 14 onward.
+        EXISTS (
+          SELECT 1 FROM pg_roles AS predefined
+          WHERE predefined.rolname = 'pg_read_all_data'
+            AND pg_has_role(current_user, predefined.oid, 'MEMBER')
+        ) AS can_read_all_data,
+        EXISTS (
+          SELECT 1 FROM pg_roles AS predefined
+          WHERE predefined.rolname = 'pg_write_all_data'
+            AND pg_has_role(current_user, predefined.oid, 'MEMBER')
+        ) AS can_write_all_data,
+        EXISTS (
+          SELECT 1
+          FROM pg_class AS candidate
+          JOIN pg_namespace AS candidate_schema ON candidate_schema.oid = candidate.relnamespace
+          WHERE candidate.relkind IN ('r', 'p', 'v', 'm', 'f')
+            AND candidate_schema.nspname NOT IN ('pg_catalog', 'information_schema')
+            AND (
+              has_table_privilege(current_user, candidate.oid, 'INSERT')
+              OR has_table_privilege(current_user, candidate.oid, 'UPDATE')
+              OR has_table_privilege(current_user, candidate.oid, 'DELETE')
+              OR has_table_privilege(current_user, candidate.oid, 'TRUNCATE')
+              OR has_table_privilege(current_user, candidate.oid, 'TRIGGER')
+            )
+        ) AS can_write_tables,
+        EXISTS (
+          SELECT 1
+          FROM pg_class AS candidate
+          JOIN pg_namespace AS candidate_schema ON candidate_schema.oid = candidate.relnamespace
+          WHERE candidate.relkind = 'S'
+            AND candidate_schema.nspname NOT IN ('pg_catalog', 'information_schema')
+            AND (
+              has_sequence_privilege(current_user, candidate.oid, 'USAGE')
+              OR has_sequence_privilege(current_user, candidate.oid, 'UPDATE')
+            )
+        ) AS can_advance_sequences
+      FROM pg_roles
+      WHERE rolname = current_user
+    `);
+    const privileges = result.rows[0] || {};
+    const unsafe = this.mode === "write"
+      ? Object.entries(privileges).filter(([name, enabled]) =>
+          !["can_write_tables", "can_advance_sequences"].includes(name) && enabled === true
+        )
+      : Object.entries(privileges).filter(([, enabled]) => enabled === true);
+    if (unsafe.length > 0) {
+      throw new Error(
+        `Database role has unsafe privileges: ${unsafe.map(([name]) => name).join(", ")}.`
+      );
+    }
+
+    const accessible = await this.pool.query(ACCESSIBLE_RELATIONS_QUERY);
+    enforceGrantScope(
+      "PostgreSQL",
+      accessible.rows.map((row) => ({ schema: row.schema_name, name: row.object_name })),
+      {
+        allowedSchemas: this.allowedSchemas,
+        allowedTables: this.allowedTables,
+        rawSelectEnabled: this.allowArbitrarySelect,
+      },
+      this
+    );
   }
 
   getAvailableTools() {

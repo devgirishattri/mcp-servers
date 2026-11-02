@@ -25,12 +25,15 @@ import {
   createSafeErrorResult,
   createLimitedLineInput,
   createJsonResult as createSharedJsonResult,
+  enforceGrantScope,
   FILTERS_INPUT_SCHEMA,
   filterAllowedColumns,
   isLoopbackHost,
+  isPrivilegeVerificationFresh,
   parseCsvSet,
   parseNonNegativeInteger as parseSharedNonNegativeInteger,
   parsePositiveInteger as parseSharedPositiveInteger,
+  parsePrivilegeRecheckMs,
   requireMutationConfirmation,
   validateDataObject as validateSharedDataObject,
   validateFilters as validateSharedFilters,
@@ -190,6 +193,34 @@ const PRIVILEGE_QUERY = `
           ['UPDATE', 'ALTER']
         )}
     `;
+// User tables and views the login can reach through any object- or column-level privilege.
+// HAS_PERMS_BY_NAME at object level returns 0 when only column grants exist, so columns are
+// checked separately. Used to compare effective grants with ALLOWED_SCHEMAS/ALLOWED_TABLES.
+const ACCESSIBLE_OBJECTS_QUERY = `
+      SELECT SCHEMA_NAME(candidate.schema_id) AS schema_name, candidate.name AS object_name
+      FROM sys.objects AS candidate
+      CROSS APPLY (
+        SELECT QUOTENAME(SCHEMA_NAME(candidate.schema_id)) + '.' + QUOTENAME(candidate.name) AS qualified_name
+      ) AS securable
+      WHERE candidate.type IN ('U', 'V')
+        AND candidate.is_ms_shipped = 0
+        AND (
+          HAS_PERMS_BY_NAME(securable.qualified_name, 'OBJECT', 'SELECT') = 1
+          OR HAS_PERMS_BY_NAME(securable.qualified_name, 'OBJECT', 'INSERT') = 1
+          OR HAS_PERMS_BY_NAME(securable.qualified_name, 'OBJECT', 'UPDATE') = 1
+          OR HAS_PERMS_BY_NAME(securable.qualified_name, 'OBJECT', 'DELETE') = 1
+          OR EXISTS (
+            SELECT 1
+            FROM sys.columns AS candidate_column
+            WHERE candidate_column.object_id = candidate.object_id
+              AND (
+                HAS_PERMS_BY_NAME(securable.qualified_name, 'OBJECT', 'SELECT', candidate_column.name, 'COLUMN') = 1
+                OR HAS_PERMS_BY_NAME(securable.qualified_name, 'OBJECT', 'UPDATE', candidate_column.name, 'COLUMN') = 1
+              )
+          )
+        )
+      ORDER BY schema_name, object_name
+    `;
 const CONFIRM_DESCRIPTION =
   'Set to true only after the user has approved this exact change. This flag is supplied by the ' +
   'caller and is not proof of approval; keep this tool on manual approval in the MCP client.';
@@ -273,6 +304,7 @@ class MSSQLMCPServer {
       );
     }
     this.verifyDbPrivileges = process.env.VERIFY_DB_PRIVILEGES !== 'false';
+    this.privilegeRecheckMs = parsePrivilegeRecheckMs(process.env.PRIVILEGE_RECHECK_SECONDS);
     this.maxRows = this.parseNonNegativeInteger(process.env.MAX_ROWS, 1000, 'MAX_ROWS');
     this.maxAffectedRows = this.parseNonNegativeInteger(
       process.env.MAX_AFFECTED_ROWS,
@@ -341,6 +373,10 @@ class MSSQLMCPServer {
     // Initialize database connection pool
     this.pool = null;
     this.poolPromise = null;
+    this.securityVerificationPromise = null;
+    this.securityVerified = false;
+    this.securityVerifiedAt = 0;
+    this.grantScopeSummary = '';
     this.config = this.buildConnectionConfig();
 
     this.setupToolHandlers();
@@ -591,10 +627,47 @@ class MSSQLMCPServer {
         `Database login has unsafe privileges: ${unsafe.map(([name]) => name).join(', ')}.`
       );
     }
+
+    const accessible = await pool.request().query(ACCESSIBLE_OBJECTS_QUERY);
+    enforceGrantScope(
+      'MSSQL',
+      (accessible.recordset || []).map((row) => ({ schema: row.schema_name, name: row.object_name })),
+      {
+        allowedSchemas: this.allowedSchemas,
+        allowedTables: this.allowedTables,
+        rawSelectEnabled: this.allowArbitrarySelect,
+      },
+      this
+    );
+  }
+
+  async ensureSecurityVerified(pool) {
+    if (
+      !this.verifyDbPrivileges ||
+      isPrivilegeVerificationFresh(this.securityVerified, this.securityVerifiedAt, this.privilegeRecheckMs)
+    ) {
+      return;
+    }
+    if (!this.securityVerificationPromise) {
+      this.securityVerificationPromise = this.verifyConnectionSecurity(pool).then(
+        () => {
+          this.securityVerified = true;
+          this.securityVerifiedAt = Date.now();
+        },
+        (error) => {
+          this.securityVerified = false;
+          throw error;
+        }
+      ).finally(() => {
+        this.securityVerificationPromise = null;
+      });
+    }
+    return this.securityVerificationPromise;
   }
 
   async getPool() {
     if (this.pool) {
+      await this.ensureSecurityVerified(this.pool);
       return this.pool;
     }
     if (!this.poolPromise) {
@@ -605,7 +678,7 @@ class MSSQLMCPServer {
           pool.on('error', () => {
             console.error('[MSSQL MCP] An idle database connection failed; the pool will replace it.');
           });
-          await this.verifyConnectionSecurity(pool);
+          await this.ensureSecurityVerified(pool);
           this.pool = pool;
           debugLog(`[MSSQL MCP] Successfully connected to SQL Server`);
           return pool;

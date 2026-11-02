@@ -204,6 +204,66 @@ test('live MSSQL security, limits, and pool behavior', { skip: !enabled, timeout
       }
     );
 
+    const readLoginEnvironment = {
+      DB_HOST: host,
+      DB_PORT: String(port),
+      DB_NAME: database,
+      DB_USER: login,
+      DB_PASSWORD: loginPassword,
+      DB_ENCRYPT: 'true',
+      DB_TRUST_SERVER_CERTIFICATE: 'true',
+      MCP_MODE: 'read',
+      ALLOWED_SCHEMAS: 'dbo',
+      ALLOWED_TABLES: 'dbo.sample',
+      ALLOWED_COLUMNS: undefined,
+      VERIFY_DB_PRIVILEGES: 'true',
+    };
+
+    // A column grant on a table outside ALLOWED_TABLES widens what raw SELECT can read.
+    await testDb.request().query(`GRANT SELECT (id) ON dbo.secrets TO [${login}]`);
+    try {
+      await withEnvironment({ ...readLoginEnvironment, ALLOW_ARBITRARY_SELECT: 'true' }, async () => {
+        const rawServer = new MSSQLMCPServer();
+        try {
+          await assert.rejects(
+            rawServer.getPool(),
+            /1 object\(s\) outside ALLOWED_SCHEMAS\/ALLOWED_TABLES/
+          );
+        } finally {
+          if (rawServer.pool) await rawServer.pool.close();
+        }
+      });
+      await withEnvironment({ ...readLoginEnvironment, ALLOW_ARBITRARY_SELECT: 'false' }, async () => {
+        const structuredServer = new MSSQLMCPServer();
+        try {
+          await structuredServer.getPool();
+          assert.match(structuredServer.grantScopeSummary, /dbo\.secrets/);
+        } finally {
+          if (structuredServer.pool) await structuredServer.pool.close();
+        }
+      });
+    } finally {
+      await testDb.request().query(`REVOKE SELECT (id) ON dbo.secrets FROM [${login}]`);
+    }
+
+    // A grant added while the server runs is caught by the next periodic re-check.
+    await withEnvironment(
+      { ...readLoginEnvironment, ALLOW_ARBITRARY_SELECT: 'true', PRIVILEGE_RECHECK_SECONDS: '60' },
+      async () => {
+        const recheckServer = new MSSQLMCPServer();
+        try {
+          await recheckServer.getPool();
+          await testDb.request().query(`GRANT INSERT ON dbo.sample TO [${login}]`);
+          await recheckServer.getPool();
+          recheckServer.securityVerifiedAt -= 61000;
+          await assert.rejects(recheckServer.getPool(), /unsafe privileges: has_object_write_permission/);
+        } finally {
+          await testDb.request().query(`REVOKE INSERT ON dbo.sample FROM [${login}]`);
+          if (recheckServer.pool) await recheckServer.pool.close();
+        }
+      }
+    );
+
     const viewPassword = `Mcp!${randomUUID()}aA1`;
     const writePassword = `Mcp!${randomUUID()}aA1`;
     await master.request().query(`CREATE LOGIN [${viewLogin}] WITH PASSWORD = '${viewPassword}', CHECK_POLICY = ON`);

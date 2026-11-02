@@ -208,6 +208,82 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
       await admin.query(`REVOKE pg_signal_backend FROM "${role}"`);
     }
 
+    const readRoleEnvironment = {
+      DB_HOST: adminConfig.host,
+      DB_PORT: String(adminConfig.port),
+      DB_NAME: adminConfig.database,
+      DB_USER: role,
+      DB_PASSWORD: rolePassword,
+      DB_SSL_MODE: "disable",
+      MCP_MODE: "read",
+      ALLOWED_SCHEMAS: schema,
+      ALLOWED_TABLES: `${schema}.sample`,
+      VERIFY_DB_PRIVILEGES: "true",
+    };
+
+    // A column grant on a table outside ALLOWED_TABLES widens what raw SELECT can read.
+    await admin.query(`CREATE TABLE "${schema}".outside (id integer, payroll text)`);
+    await admin.query(`GRANT SELECT (id) ON "${schema}".outside TO "${role}"`);
+    try {
+      await withEnvironment({ ...readRoleEnvironment, ALLOW_ARBITRARY_SELECT: "true" }, async () => {
+        const rawServer = new PostgreSQLMCPServer();
+        try {
+          await assert.rejects(
+            rawServer.ensureSecurityVerified(),
+            /1 object\(s\) outside ALLOWED_SCHEMAS\/ALLOWED_TABLES/
+          );
+        } finally {
+          await rawServer.shutdown();
+        }
+      });
+      await withEnvironment({ ...readRoleEnvironment, ALLOW_ARBITRARY_SELECT: "false" }, async () => {
+        const structuredServer = new PostgreSQLMCPServer();
+        try {
+          await structuredServer.ensureSecurityVerified();
+          assert.match(structuredServer.grantScopeSummary, /\.outside\b/);
+        } finally {
+          await structuredServer.shutdown();
+        }
+      });
+    } finally {
+      await admin.query(`REVOKE SELECT (id) ON "${schema}".outside FROM "${role}"`);
+    }
+
+    await admin.query(`GRANT pg_read_all_data TO "${role}"`);
+    try {
+      await withEnvironment({ ...readRoleEnvironment, ALLOW_ARBITRARY_SELECT: "false" }, async () => {
+        const readAllServer = new PostgreSQLMCPServer();
+        try {
+          await assert.rejects(readAllServer.ensureSecurityVerified(), /unsafe privileges: can_read_all_data/);
+        } finally {
+          await readAllServer.shutdown();
+        }
+      });
+    } finally {
+      await admin.query(`REVOKE pg_read_all_data FROM "${role}"`);
+    }
+
+    // A grant added while the server runs is caught by the next periodic re-check.
+    await withEnvironment(
+      { ...readRoleEnvironment, ALLOW_ARBITRARY_SELECT: "true", PRIVILEGE_RECHECK_SECONDS: "60" },
+      async () => {
+        const recheckServer = new PostgreSQLMCPServer();
+        try {
+          await recheckServer.ensureSecurityVerified();
+          await admin.query(`GRANT pg_signal_backend TO "${role}"`);
+          await recheckServer.ensureSecurityVerified();
+          recheckServer.securityVerifiedAt -= 61000;
+          await assert.rejects(
+            recheckServer.ensureSecurityVerified(),
+            /unsafe privileges: can_signal_backend/
+          );
+        } finally {
+          await admin.query(`REVOKE pg_signal_backend FROM "${role}"`);
+          await recheckServer.shutdown();
+        }
+      }
+    );
+
     await admin.query(`CREATE ROLE "${writeRole}" LOGIN PASSWORD '${writeRolePassword}'`);
     await admin.query(
       `CREATE TABLE "${schema}".secrets (id integer PRIMARY KEY, note text NOT NULL, secret text NOT NULL DEFAULT 'hidden')`
