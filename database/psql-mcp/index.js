@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { checkServerIdentity } from "node:tls";
@@ -19,11 +20,16 @@ import {
   allowedColumnNames,
   assertAllowedFunctions,
   assertInputBudget,
+  assertInsecureTransportAllowed,
+  auditEvent,
   auditMutation,
+  auditToolFailure,
   createSafeErrorResult,
   createLimitedLineInput,
   createJsonResult as createSharedJsonResult,
   FILTERS_INPUT_SCHEMA,
+  filterAllowedColumns,
+  isLoopbackHost,
   parseCsvSet,
   parseNonNegativeInteger as parseSharedNonNegativeInteger,
   parsePositiveInteger as parseSharedPositiveInteger,
@@ -31,6 +37,7 @@ import {
   validateDataObject as validateSharedDataObject,
   validateFilters as validateSharedFilters,
   validateIdentifier as validateSharedIdentifier,
+  warnIfAuditDisabled,
 } from "../shared/security.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -113,6 +120,10 @@ const FORBIDDEN_SELECT_FUNCTIONS = new Set([
   "pg_try_advisory_xact_lock_shared",
 ]);
 
+const CONFIRM_DESCRIPTION =
+  "Set to true only after the user has approved this exact change. This flag is supplied by the " +
+  "caller and is not proof of approval; keep this tool on manual approval in the MCP client.";
+
 function parseAllowedSchemas(value) {
   const schemas = new Set(
     Array.from(parseCsvSet(value, "public")).filter(
@@ -126,7 +137,9 @@ function parseAllowedSchemas(value) {
 }
 
 function maskSqlLiterals(query, { preserveQuotedIdentifiers = false } = {}) {
-  const characters = Array.from(query);
+  // Index by UTF-16 code unit on both sides; Array.from() would split by code point and shift
+  // every write after an astral character (such as an emoji), unmasking executable text.
+  const characters = query.split("");
 
   for (let index = 0; index < query.length; index += 1) {
     const character = query[index];
@@ -278,6 +291,12 @@ class PostgreSQLMCPServer {
       262144,
       "MAX_REQUEST_BYTES"
     );
+    if (this.returnMutationRows && this.maxAffectedRows === 0) {
+      throw new Error("RETURN_MUTATION_ROWS=true requires a positive MAX_AFFECTED_ROWS limit.");
+    }
+    if (this.returnMutationRows && this.maxResponseBytes === 0) {
+      throw new Error("RETURN_MUTATION_ROWS=true requires a positive MAX_RESPONSE_BYTES limit.");
+    }
 
     this.server = new Server(
       {
@@ -308,15 +327,17 @@ class PostgreSQLMCPServer {
 
   buildSslConfig() {
     const host = (process.env.DB_HOST || "localhost").toLowerCase();
-    const localHost = ["localhost", "127.0.0.1", "::1"].includes(host);
+    const localHost = isLoopbackHost(host);
     const legacyMode = process.env.DB_SSL === "true" ? "require" : localHost ? "disable" : "verify-full";
     const mode = (process.env.DB_SSL_MODE || legacyMode).toLowerCase();
 
     if (mode === "disable") {
+      assertInsecureTransportAllowed(host, "DB_SSL_MODE=disable");
       return false;
     }
 
     if (mode === "require") {
+      assertInsecureTransportAllowed(host, "DB_SSL_MODE=require");
       return { rejectUnauthorized: false };
     }
 
@@ -525,8 +546,12 @@ class PostgreSQLMCPServer {
     return createSharedJsonResult(payload, this.maxResponseBytes);
   }
 
-  createErrorResult(error) {
-    return createSafeErrorResult(error, this.maxResponseBytes, debugLog);
+  createErrorResult(error, errorId = randomUUID()) {
+    return createSafeErrorResult(error, this.maxResponseBytes, debugLog, errorId);
+  }
+
+  projectReturnedRows(schemaName, tableName, rows) {
+    return filterAllowedColumns(schemaName, tableName, rows, this.allowedColumns);
   }
 
   async ensureSecurityVerified() {
@@ -680,7 +705,7 @@ class PostgreSQLMCPServer {
               },
               confirm: {
                 type: "boolean",
-                description: "Must be true after explicit user approval",
+                description: CONFIRM_DESCRIPTION,
               },
             },
             required: ["table", "data", "confirm"],
@@ -703,7 +728,7 @@ class PostgreSQLMCPServer {
               },
               confirm: {
                 type: "boolean",
-                description: "Must be true after explicit user approval",
+                description: CONFIRM_DESCRIPTION,
               },
             },
             required: ["table", "data", "filters", "confirm"],
@@ -729,7 +754,7 @@ class PostgreSQLMCPServer {
             },
             confirm: {
               type: "boolean",
-              description: "Must be true after explicit user approval",
+              description: CONFIRM_DESCRIPTION,
             },
           },
           required: ["table", "filters", "confirm"],
@@ -776,7 +801,9 @@ class PostgreSQLMCPServer {
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {
-        return this.createErrorResult(error);
+        const errorId = randomUUID();
+        auditToolFailure("postgresql", name, error, errorId);
+        return this.createErrorResult(error, errorId);
       }
     });
   }
@@ -870,6 +897,7 @@ class PostgreSQLMCPServer {
       await client.query("ROLLBACK");
       transactionStarted = false;
 
+      auditEvent("postgresql", "raw_query", "execute_query", { rowCount: rows.length, truncated });
       return this.createJsonResult({
         rows,
         rowCount: rows.length,
@@ -996,7 +1024,9 @@ class PostgreSQLMCPServer {
 
     auditMutation("postgresql", "insert", { schema: schemaName, table, rowsAffected: result.rowCount });
     return this.createJsonResult({
-      inserted: this.returnMutationRows ? result.rows[0] : undefined,
+      inserted: this.returnMutationRows
+        ? this.projectReturnedRows(schemaName, table, result.rows)[0]
+        : undefined,
       rowCount: result.rowCount,
     });
   }
@@ -1062,7 +1092,9 @@ class PostgreSQLMCPServer {
       transactionStarted = false;
       auditMutation("postgresql", "update", { schema: schemaName, table, rowsAffected: result.rowCount });
       return this.createJsonResult({
-        updated: this.returnMutationRows ? result.rows : undefined,
+        updated: this.returnMutationRows
+          ? this.projectReturnedRows(schemaName, table, result.rows)
+          : undefined,
         rowCount: result.rowCount,
       });
     } catch (error) {
@@ -1110,7 +1142,9 @@ class PostgreSQLMCPServer {
       transactionStarted = false;
       auditMutation("postgresql", "delete", { schema: schemaName, table, rowsAffected: result.rowCount });
       return this.createJsonResult({
-        deleted: this.returnMutationRows ? result.rows : undefined,
+        deleted: this.returnMutationRows
+          ? this.projectReturnedRows(schemaName, table, result.rows)
+          : undefined,
         rowCount: result.rowCount,
       });
     } catch (error) {
@@ -1151,6 +1185,7 @@ class PostgreSQLMCPServer {
     };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
+    warnIfAuditDisabled("PostgreSQL");
     console.error("PostgreSQL MCP server running on stdio");
   }
 }

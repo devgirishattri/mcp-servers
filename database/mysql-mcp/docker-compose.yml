@@ -5,7 +5,7 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-mcp_mcp_test}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in your shell}
     ports:
-      - "${MYSQL_PORT:-53306}:3306"
+      - "127.0.0.1:${MYSQL_PORT:-53306}:3306"
     volumes:
       - mysql-test-data:/var/lib/mysql
     healthcheck:

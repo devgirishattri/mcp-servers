@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,11 +15,15 @@ import mysql from "mysql2";
 import {
   assertAllowedFunctions,
   assertInputBudget,
+  assertInsecureTransportAllowed,
+  auditEvent,
   auditMutation,
+  auditToolFailure,
   createJsonResult as createSharedJsonResult,
   createLimitedLineInput,
   createSafeErrorResult,
   FILTERS_INPUT_SCHEMA,
+  isLoopbackHost,
   parseCsvSet,
   parseNonNegativeInteger as parseSharedNonNegativeInteger,
   parsePositiveInteger as parseSharedPositiveInteger,
@@ -26,6 +31,7 @@ import {
   validateDataObject as validateSharedDataObject,
   validateFilters as validateSharedFilters,
   validateIdentifier as validateSharedIdentifier,
+  warnIfAuditDisabled,
 } from "../shared/security.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -49,8 +55,14 @@ const FORBIDDEN_SQL_PATTERN = /(;|--|#|\/\*|\*\/|@|:=|\b(insert|update|delete|re
 const LOCKING_READ_PATTERN = /\b(?:for\s+(?:update|share)|lock\s+in\s+share\s+mode)\b/i;
 const QUOTED_FUNCTION_PATTERN = /(?:`(?:``|[^`])+`|"(?:""|[^"])+")\s*\(/;
 
+const CONFIRM_DESCRIPTION =
+  "Set to true only after the user has approved this exact change. This flag is supplied by the " +
+  "caller and is not proof of approval; keep this tool on manual approval in the MCP client.";
+
 function maskSqlLiterals(query) {
-  const characters = Array.from(query);
+  // Index by UTF-16 code unit on both sides; Array.from() would split by code point and shift
+  // every write after an astral character (such as an emoji), unmasking executable text.
+  const characters = query.split("");
 
   for (let index = 0; index < query.length; index += 1) {
     const quote = query[index];
@@ -289,10 +301,16 @@ class MySQLMCPServer {
 
   buildSslConfig() {
     const host = (process.env.DB_HOST || "localhost").toLowerCase();
-    const localHost = ["localhost", "127.0.0.1", "::1"].includes(host);
+    const localHost = isLoopbackHost(host);
     const mode = (process.env.DB_SSL_MODE || (localHost ? "disable" : "verify-full")).toLowerCase();
-    if (mode === "disable") return undefined;
-    if (mode === "require") return { rejectUnauthorized: false };
+    if (mode === "disable") {
+      assertInsecureTransportAllowed(host, "DB_SSL_MODE=disable");
+      return undefined;
+    }
+    if (mode === "require") {
+      assertInsecureTransportAllowed(host, "DB_SSL_MODE=require");
+      return { rejectUnauthorized: false };
+    }
     if (mode === "verify-full") {
       const ssl = { rejectUnauthorized: true };
       if (process.env.DB_SSL_CA_FILE) {
@@ -475,8 +493,8 @@ class MySQLMCPServer {
     return createSharedJsonResult(payload, this.maxResponseBytes);
   }
 
-  createErrorResult(error) {
-    return createSafeErrorResult(error, this.maxResponseBytes, debugLog);
+  createErrorResult(error, errorId = randomUUID()) {
+    return createSafeErrorResult(error, this.maxResponseBytes, debugLog, errorId);
   }
 
   metadataRowLimit() {
@@ -746,7 +764,7 @@ class MySQLMCPServer {
               table: { type: "string", description: "Table name" },
               data: { type: "object", description: "Column/value pairs" },
               schema_name: { type: "string", default: schemaDefault },
-              confirm: { type: "boolean", description: "Must be true after explicit approval" },
+              confirm: { type: "boolean", description: CONFIRM_DESCRIPTION },
             },
             required: ["table", "data", "confirm"],
           },
@@ -762,7 +780,7 @@ class MySQLMCPServer {
               data: { type: "object", description: "Column/value pairs" },
               filters: FILTERS_INPUT_SCHEMA,
               schema_name: { type: "string", default: schemaDefault },
-              confirm: { type: "boolean", description: "Must be true after explicit approval" },
+              confirm: { type: "boolean", description: CONFIRM_DESCRIPTION },
             },
             required: ["table", "data", "filters", "confirm"],
           },
@@ -780,7 +798,7 @@ class MySQLMCPServer {
             table: { type: "string", description: "Table name" },
             filters: FILTERS_INPUT_SCHEMA,
             schema_name: { type: "string", default: schemaDefault },
-            confirm: { type: "boolean", description: "Must be true after explicit approval" },
+            confirm: { type: "boolean", description: CONFIRM_DESCRIPTION },
           },
           required: ["table", "filters", "confirm"],
         },
@@ -823,7 +841,9 @@ class MySQLMCPServer {
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {
-        return this.createErrorResult(error);
+        const errorId = randomUUID();
+        auditToolFailure("mysql", name, error, errorId);
+        return this.createErrorResult(error, errorId);
       }
     });
   }
@@ -918,6 +938,7 @@ class MySQLMCPServer {
         }
         transactionStarted = false;
       }
+      auditEvent("mysql", "raw_query", "execute_query", { rowCount: rows.length, truncated });
       return this.createJsonResult({
         rows,
         rowCount: rows.length,
@@ -1298,6 +1319,7 @@ class MySQLMCPServer {
     };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
+    warnIfAuditDisabled("MySQL");
     console.error("MySQL MCP server running on stdio");
   }
 }

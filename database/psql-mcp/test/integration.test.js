@@ -39,6 +39,8 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
   const schema = `mcp_it_${suffix}`;
   const role = `mcp_it_ro_${suffix}`;
   const rolePassword = randomUUID();
+  const writeRole = `mcp_it_rw_${suffix}`;
+  const writeRolePassword = randomUUID();
   const admin = new Pool(adminConfig);
   let server;
 
@@ -140,6 +142,21 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
           /forbidden function/
         );
         assert.throws(() => server.validateSelectQuery("SELECT 1 -- comment"), /forbidden SQL syntax/);
+        const smiles = JSON.parse(
+          (
+            await server.executeQuery(
+              `SELECT '\u{1F600}' AS smile, id FROM "${schema}".sample ORDER BY id`
+            )
+          ).content[0].text
+        );
+        assert.equal(smiles.rows[0].smile, "\u{1F600}");
+        assert.throws(
+          () =>
+            server.validateSelectQuery(
+              `SELECT 1 AS k, '${"\u{1F600}".repeat(8)}' = lower(note) AS m FROM "${schema}".sample`
+            ),
+          /not allowlisted: lower/
+        );
         await assert.rejects(server.describeTable("sample", "public"), /not allowlisted/);
 
         await withEnvironment(
@@ -191,6 +208,53 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
       await admin.query(`REVOKE pg_signal_backend FROM "${role}"`);
     }
 
+    await admin.query(`CREATE ROLE "${writeRole}" LOGIN PASSWORD '${writeRolePassword}'`);
+    await admin.query(
+      `CREATE TABLE "${schema}".secrets (id integer PRIMARY KEY, note text NOT NULL, secret text NOT NULL DEFAULT 'hidden')`
+    );
+    await admin.query(`GRANT CONNECT ON DATABASE "${adminConfig.database}" TO "${writeRole}"`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO "${writeRole}"`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON "${schema}".secrets TO "${writeRole}"`);
+    await withEnvironment(
+      {
+        DB_HOST: adminConfig.host,
+        DB_PORT: String(adminConfig.port),
+        DB_NAME: adminConfig.database,
+        DB_USER: writeRole,
+        DB_PASSWORD: writeRolePassword,
+        DB_SSL_MODE: "disable",
+        MCP_MODE: "write",
+        ALLOW_WRITES: "true",
+        ALLOW_DELETE: "true",
+        ALLOW_ARBITRARY_SELECT: "false",
+        ALLOWED_SCHEMAS: schema,
+        ALLOWED_TABLES: `${schema}.secrets`,
+        ALLOWED_COLUMNS: `${schema}.secrets.id,${schema}.secrets.note`,
+        RETURN_MUTATION_ROWS: "true",
+        VERIFY_DB_PRIVILEGES: "true",
+      },
+      async () => {
+        const writeServer = new PostgreSQLMCPServer();
+        try {
+          const inserted = JSON.parse(
+            (await writeServer.executeInsert("secrets", { id: 1, note: "visible" }, schema)).content[0].text
+          );
+          assert.deepEqual(inserted.inserted, { id: 1, note: "visible" });
+          const filters = [{ column: "id", operator: "eq", value: 1 }];
+          const updated = JSON.parse(
+            (await writeServer.executeUpdate("secrets", { note: "changed" }, filters, schema)).content[0].text
+          );
+          assert.deepEqual(updated.updated, [{ id: 1, note: "changed" }]);
+          const deleted = JSON.parse(
+            (await writeServer.executeDelete("secrets", filters, schema)).content[0].text
+          );
+          assert.deepEqual(deleted.deleted, [{ id: 1, note: "changed" }]);
+        } finally {
+          await writeServer.shutdown();
+        }
+      }
+    );
+
     await withEnvironment(
       {
         DB_HOST: adminConfig.host,
@@ -217,8 +281,14 @@ test("live PostgreSQL security and query behavior", { skip: !enabled, timeout: 6
       `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()`,
       [role]
     ).catch(() => {});
-    await admin.query(`DROP OWNED BY "${role}"`).catch(() => {});
-    await admin.query(`DROP ROLE IF EXISTS "${role}"`).catch(() => {});
+    for (const name of [role, writeRole]) {
+      await admin.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()`,
+        [name]
+      ).catch(() => {});
+      await admin.query(`DROP OWNED BY "${name}"`).catch(() => {});
+      await admin.query(`DROP ROLE IF EXISTS "${name}"`).catch(() => {});
+    }
     await admin.end();
   }
 });

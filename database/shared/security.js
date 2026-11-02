@@ -244,19 +244,67 @@ export function assertAllowedFunctions(maskedQuery, allowedFunctions, forbiddenF
   }
 }
 
+export function filterAllowedColumns(schemaName, tableName, rows, allowedColumns) {
+  if (!Array.isArray(rows) || allowedColumns.size === 0) {
+    return rows;
+  }
+  const prefix = `${schemaName}.${tableName}.`.toLowerCase();
+  return rows.map((row) => {
+    if (!row || typeof row !== "object") {
+      return row;
+    }
+    const projected = {};
+    for (const [column, value] of Object.entries(row)) {
+      if (allowedColumns.has(`${prefix}${column.toLowerCase()}`)) {
+        projected[column] = value;
+      }
+    }
+    return projected;
+  });
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "::1", "[::1]"]);
+
+export function isLoopbackHost(host) {
+  const normalized = String(host ?? "").trim().toLowerCase();
+  return LOOPBACK_HOSTS.has(normalized) || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
+export function assertInsecureTransportAllowed(host, setting) {
+  if (isLoopbackHost(host) || process.env.ALLOW_INSECURE_TLS === "true") {
+    return;
+  }
+  throw new Error(
+    `${setting} disables TLS or certificate verification and is refused for the non-loopback host ${host}. ` +
+      "Use verified TLS, or set ALLOW_INSECURE_TLS=true to accept the risk explicitly."
+  );
+}
+
 export function requireMutationConfirmation(confirmed, operation) {
   if (confirmed !== true) {
     throw new Error(`${operation} requires confirm=true after explicit user approval.`);
   }
 }
 
-export function auditMutation(engine, operation, metadata = {}) {
-  if (process.env.AUDIT_LOG === "false") {
+export const AUDITED_TOOLS = new Set([
+  "execute_query",
+  "execute_insert",
+  "execute_update",
+  "execute_delete",
+  "execute_stored_procedure",
+]);
+
+function auditDisabled() {
+  return process.env.AUDIT_LOG === "false";
+}
+
+export function auditEvent(engine, category, operation, metadata = {}) {
+  if (auditDisabled()) {
     return;
   }
   const event = {
     timestamp: new Date().toISOString(),
-    category: "database_mutation",
+    category,
     engine,
     operation,
     ...metadata,
@@ -264,17 +312,44 @@ export function auditMutation(engine, operation, metadata = {}) {
   console.error(`[MCP Audit] ${JSON.stringify(event)}`);
 }
 
-export function createSafeErrorResult(error, maxResponseBytes, log = () => {}) {
-  const errorId = randomUUID();
-  const isDatabaseError =
+export function auditMutation(engine, operation, metadata = {}) {
+  auditEvent(engine, "database_mutation", operation, metadata);
+}
+
+export function auditToolFailure(engine, tool, error, errorId) {
+  if (!AUDITED_TOOLS.has(tool)) {
+    return;
+  }
+  auditEvent(engine, "tool_failure", tool, {
+    outcome: "error",
+    errorType: isDatabaseError(error) ? "database" : "policy",
+    reference: errorId,
+  });
+}
+
+export function warnIfAuditDisabled(engine) {
+  if (auditDisabled()) {
+    console.error(
+      `[MCP Audit] WARNING: AUDIT_LOG=false; ${engine} tool calls and mutations will not be audited.`
+    );
+  }
+}
+
+function isDatabaseError(error) {
+  return (
     DATABASE_ERROR_NAMES.has(error?.name) ||
     typeof error?.code === "string" ||
-    typeof error?.number === "number";
-  const publicMessage = isDatabaseError
+    typeof error?.number === "number"
+  );
+}
+
+export function createSafeErrorResult(error, maxResponseBytes, log = () => {}, errorId = randomUUID()) {
+  const databaseError = isDatabaseError(error);
+  const publicMessage = databaseError
     ? `Database operation failed. Reference: ${errorId}`
     : error?.message || `Operation failed. Reference: ${errorId}`;
 
-  if (isDatabaseError) {
+  if (databaseError) {
     log(`Database error ${errorId}: code=${error?.code || error?.name || "unknown"}`);
   }
 

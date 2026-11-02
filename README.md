@@ -47,6 +47,13 @@ Set the absolute repository path, securely read each database password into a
 temporary shell variable, and register only the servers you need. Replace the
 example connection values with the user's own database settings.
 
+The examples leave the TLS settings at their defaults. For loopback hosts
+(`localhost`, `127.0.0.1`, `::1`) the servers connect without TLS or trust the
+local SQL Server certificate. For any other host they require a verified
+certificate, and they refuse to start with `DB_SSL_MODE=disable`,
+`DB_SSL_MODE=require`, `DB_ENCRYPT=false`, or `DB_TRUST_SERVER_CERTIFICATE=true`
+unless `ALLOW_INSECURE_TLS=true` is also set.
+
 PostgreSQL:
 
 ```bash
@@ -59,7 +66,6 @@ claude mcp add postgresql -s local \
   -e DB_NAME=your_database \
   -e DB_USER=mcp_ro \
   -e "DB_PASSWORD=$POSTGRES_MCP_PASSWORD" \
-  -e DB_SSL_MODE=disable \
   -- node "$MCP_REPO/database/psql-mcp/index.js"
 
 unset POSTGRES_MCP_PASSWORD
@@ -78,7 +84,6 @@ claude mcp add mssql -s local \
   -e DB_USER=mcp_ro \
   -e "DB_PASSWORD=$MSSQL_MCP_PASSWORD" \
   -e DB_ENCRYPT=true \
-  -e DB_TRUST_SERVER_CERTIFICATE=true \
   -- node "$MCP_REPO/database/mssql-mcp/index.js"
 
 unset MSSQL_MCP_PASSWORD
@@ -96,14 +101,16 @@ claude mcp add mysql -s local \
   -e DB_NAME=your_database \
   -e DB_USER=mcp_ro \
   -e "DB_PASSWORD=$MYSQL_MCP_PASSWORD" \
-  -e DB_SSL_MODE=disable \
   -- node "$MCP_REPO/database/mysql-mcp/index.js"
 
 unset MYSQL_MCP_PASSWORD
 ```
 
 Confirm the registrations with `claude mcp list`. In an interactive Claude
-Code session, use `/mcp` to inspect active servers and their tools. See the
+Code session, use `/mcp` to inspect active servers and their tools.
+
+If you register a write deployment, keep its write tools on manual approval.
+The `confirm` argument is filled in by the calling model, so it guards against accidental calls but is not proof that a person approved the change. Real approval has to come from the MCP host: keep write tools on manual, per-call approval and never auto-approve them. See the
 [Claude Code MCP documentation](https://docs.anthropic.com/en/docs/claude-code/mcp)
 for scopes and advanced configuration. Protect access to the user's Claude
 Code configuration because client-supplied environment values include database
@@ -141,7 +148,9 @@ and do not place literal credentials in a tracked project file.
 
 Set the absolute repository path, securely read each database password into a
 temporary shell variable, and register only the servers you need. Replace the
-example connection values with the user's own database settings.
+example connection values with the user's own database settings. The TLS
+defaults and the `ALLOW_INSECURE_TLS` override described in the Claude Code
+section apply here too, and write tools should stay on manual approval.
 
 PostgreSQL:
 
@@ -155,7 +164,6 @@ codex mcp add postgresql \
   --env DB_NAME=your_database \
   --env DB_USER=mcp_ro \
   --env "DB_PASSWORD=$POSTGRES_MCP_PASSWORD" \
-  --env DB_SSL_MODE=disable \
   -- node "$MCP_REPO/database/psql-mcp/index.js"
 
 unset POSTGRES_MCP_PASSWORD
@@ -174,7 +182,6 @@ codex mcp add mssql \
   --env DB_USER=mcp_ro \
   --env "DB_PASSWORD=$MSSQL_MCP_PASSWORD" \
   --env DB_ENCRYPT=true \
-  --env DB_TRUST_SERVER_CERTIFICATE=true \
   -- node "$MCP_REPO/database/mssql-mcp/index.js"
 
 unset MSSQL_MCP_PASSWORD
@@ -192,7 +199,6 @@ codex mcp add mysql \
   --env DB_NAME=your_database \
   --env DB_USER=mcp_ro \
   --env "DB_PASSWORD=$MYSQL_MCP_PASSWORD" \
-  --env DB_SSL_MODE=disable \
   -- node "$MCP_REPO/database/mysql-mcp/index.js"
 
 unset MYSQL_MCP_PASSWORD

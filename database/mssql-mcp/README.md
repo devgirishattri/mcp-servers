@@ -54,26 +54,35 @@ Configure the following variables in the MCP host:
 - `MAX_INPUT_ITEMS`: Maximum top-level parameter/data/filter items (default: 100)
 - `DB_ENCRYPT`: Enable connection encryption (default: true)
 - `DB_TRUST_SERVER_CERTIFICATE`: Trust server certificate (default: true locally, false remotely)
+- `ALLOW_INSECURE_TLS`: Permit `DB_ENCRYPT=false` or `DB_TRUST_SERVER_CERTIFICATE=true` for a non-loopback `DB_HOST` (default: false)
 - `DEBUG`: Enable startup connection logging (default: false)
 - `MCP_MODE`: Separate deployment mode, `read` or `write` (default: read)
 - `VERIFY_DB_PRIVILEGES`: Reject unsafe effective database privileges (default: true)
 - `ALLOW_ARBITRARY_SELECT`: Expose `execute_query` (default: false)
 - `ALLOW_DATABASE_LIST`: Expose `list_databases` (default: false)
-- `ALLOWED_SCHEMAS`: Comma-separated schema allowlist (default: dbo)
-- `ALLOWED_TABLES`: Optional comma-separated `schema.table` allowlist
+- `ALLOWED_SCHEMAS`: Comma-separated schema allowlist for structured tools (default: dbo)
+- `ALLOWED_TABLES`: Optional comma-separated `schema.table` allowlist for structured tools
 - `ALLOWED_COLUMNS`: Optional comma-separated `schema.table.column` allowlist for structured tools
 - `ALLOWED_SELECT_FUNCTIONS`: Comma-separated function allowlist for raw SELECT
 - `ALLOW_WRITES`: Enable insert and update tools (default: false)
 - `ALLOW_DELETE`: Enable delete tool; also requires `ALLOW_WRITES=true` (default: false)
-- `RETURN_MUTATION_ROWS`: Return changed rows instead of counts only (default: false)
-- `AUDIT_LOG`: Emit value-free mutation audit events to stderr (default: true)
+- `RETURN_MUTATION_ROWS`: Return changed rows, limited to `ALLOWED_COLUMNS` when set, instead of counts only; requires positive `MAX_AFFECTED_ROWS` and `MAX_RESPONSE_BYTES` (default: false)
+- `AUDIT_LOG`: Emit value-free audit events to stderr for mutations, raw queries, and failed raw-query or mutation calls; a warning is logged at startup when disabled (default: true)
 - `ALLOW_STORED_PROCEDURES`: Enable stored procedure tool (default: false)
 - `ALLOWED_PROCEDURES`: Comma-separated, schema-qualified stored procedure allowlist, such as `dbo.GetUsersByStatus`
 
 ## Available Tools
 
 ### Query Operations
-- **execute_query**: Execute a single allowlisted SELECT with named parameters when `ALLOW_ARBITRARY_SELECT=true`
+- **execute_query**: Execute a single SELECT with named parameters when `ALLOW_ARBITRARY_SELECT=true`
+
+`ALLOWED_SCHEMAS` and `ALLOWED_TABLES` constrain the structured tools only. Raw
+SELECT can read anything the login can read, so constrain it with SQL Server
+grants or curated views. T-SQL does not need semicolons between statements, so
+`execute_query` rejects every statement-leading keyword that cannot appear in a
+single SELECT (for example `SET`, `USE`, `BEGIN`, `DECLARE`, `WAITFOR`, `DBCC`,
+`KILL`), rejects quoted (`[name](` or `"name"(`) function calls, and runs the
+query inside a transaction with `XACT_ABORT ON` that is always rolled back.
 
 `ALLOWED_COLUMNS` is intentionally incompatible with arbitrary SELECT. Keep
 raw SELECT disabled or expose curated views when column-level boundaries are
@@ -91,7 +100,7 @@ required.
 - **execute_delete**: Delete records matching structured filters when `ALLOW_WRITES=true` and `ALLOW_DELETE=true`
 
 ### Stored Procedures
-- **execute_stored_procedure**: Execute allowlisted stored procedures in `MCP_MODE=write` when `ALLOW_STORED_PROCEDURES=true` and `confirm: true`
+- **execute_stored_procedure**: Execute allowlisted stored procedures in `MCP_MODE=write` when `ALLOW_STORED_PROCEDURES=true` and `confirm: true`. Result rows are streamed and capped by `MAX_ROWS`, `MAX_RESPONSE_BYTES`, `MAX_COLUMNS`, and `MAX_FIELD_BYTES`; the procedure still runs to completion, and allowlisted procedures must enforce their own affected-row limits.
 
 ## Usage Examples
 
@@ -188,7 +197,7 @@ Under concurrent writes, SQL Server can abort a serializable transaction because
 - **Parameterized Values**: Tool-supplied data and filter values are bound as parameters; identifiers are validated and quoted
 - **Read-Only by Default**: Mutating tools and stored procedure execution are hidden unless explicitly enabled
 - **Raw Query Disabled by Default**: `execute_query` requires explicit enablement and function allowlisting
-- **Effective-Permission Check**: Read mode rejects administrative, table-write, and sequence-write capability
+- **Effective-Permission Check**: Read mode rejects fixed server and database admin roles, server permissions such as `CONTROL SERVER`, `ALTER ANY LOGIN`, `ALTER ANY CONNECTION` and `SHUTDOWN`, DDL and schema-alter permissions, impersonation, and write access to tables, views, synonyms, and sequences
 - **Row Limit Guard**: `execute_query` limits returned rows with `MAX_ROWS` by default
 - **Affected-Row Guard**: Updates and deletes use serializable transactions and roll back when `MAX_AFFECTED_ROWS` is exceeded
 - **Resource Limits**: MCP request, input, connection, statement, row, and response-size limits are configurable
@@ -198,7 +207,7 @@ Under concurrent writes, SQL Server can abort a serializable transaction because
 - **Encrypted Connections**: SSL/TLS encryption enabled by default
 - **Connection Pooling**: Efficient resource management with configurable limits
 
-For production certificate verification, set `DB_TRUST_SERVER_CERTIFICATE=false` and ensure the SQL Server certificate chains to a trusted CA.
+For production certificate verification, set `DB_TRUST_SERVER_CERTIFICATE=false` and ensure the SQL Server certificate chains to a trusted CA. For a non-loopback `DB_HOST`, `DB_ENCRYPT=false` and `DB_TRUST_SERVER_CERTIFICATE=true` are refused at startup unless `ALLOW_INSECURE_TLS=true` is set.
 
 The SELECT and function checks are defense in depth. Database permissions are
 the primary security boundary, and `VERIFY_DB_PRIVILEGES=true` rejects unsafe
@@ -217,7 +226,7 @@ GRANT SELECT ON OBJECT::reporting.McpOrders TO mcp_ro;
 
 Use a separate `MCP_MODE=write` deployment and narrowly granted login if write
 or stored-procedure tools are enabled. Mutation calls require `confirm: true`
-and emit audit events without parameter values.
+and emit audit events without parameter values. The `confirm` argument is filled in by the calling model, so it guards against accidental calls but is not proof that a person approved the change. Real approval has to come from the MCP host: keep write tools on manual, per-call approval and never auto-approve them.
 
 ## Error Handling
 
@@ -282,7 +291,6 @@ claude mcp add mssql -s local \
   -e DB_USER=mcp_ro \
   -e "DB_PASSWORD=$MSSQL_MCP_PASSWORD" \
   -e DB_ENCRYPT=true \
-  -e DB_TRUST_SERVER_CERTIFICATE=true \
   -- node /absolute/path/to/mcp-servers/database/mssql-mcp/index.js
 
 unset MSSQL_MCP_PASSWORD
@@ -320,7 +328,6 @@ codex mcp add mssql \
   --env DB_USER=mcp_ro \
   --env "DB_PASSWORD=$MSSQL_MCP_PASSWORD" \
   --env DB_ENCRYPT=true \
-  --env DB_TRUST_SERVER_CERTIFICATE=true \
   -- node /absolute/path/to/mcp-servers/database/mssql-mcp/index.js
 
 unset MSSQL_MCP_PASSWORD
