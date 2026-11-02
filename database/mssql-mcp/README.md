@@ -58,6 +58,7 @@ Configure the following variables in the MCP host:
 - `DEBUG`: Enable startup connection logging (default: false)
 - `MCP_MODE`: Separate deployment mode, `read` or `write` (default: read)
 - `VERIFY_DB_PRIVILEGES`: Reject unsafe effective database privileges (default: true)
+- `PRIVILEGE_RECHECK_SECONDS`: Repeat the privilege check on the first tool call after this many seconds; `0` checks once per process (default: 300)
 - `ALLOW_ARBITRARY_SELECT`: Expose `execute_query` (default: false)
 - `ALLOW_DATABASE_LIST`: Expose `list_databases` (default: false)
 - `ALLOWED_SCHEMAS`: Comma-separated schema allowlist for structured tools (default: dbo)
@@ -211,7 +212,15 @@ For production certificate verification, set `DB_TRUST_SERVER_CERTIFICATE=false`
 
 The SELECT and function checks are defense in depth. Database permissions are
 the primary security boundary, and `VERIFY_DB_PRIVILEGES=true` rejects unsafe
-read-mode identities. Do not connect as `sa`, a sysadmin, or a broadly
+read-mode identities. It also compares the user tables and views the login can
+reach (including column-level grants) with `ALLOWED_SCHEMAS` and
+`ALLOWED_TABLES`. Raw SELECT is not limited by those allowlists, so when
+`ALLOW_ARBITRARY_SELECT=true` any reachable object outside them causes tools to
+be refused; with raw SELECT disabled the server only logs a warning to stderr.
+The check covers the current database only, so do not map the login into other
+databases. It repeats every `PRIVILEGE_RECHECK_SECONDS` (default 300) on the
+next tool call, and a failed repeat check refuses every tool until the grants
+pass again. Do not connect as `sa`, a sysadmin, or a broadly
 privileged login. Create a dedicated login and database user, then grant
 `SELECT` only on the specific schemas, views, or tables the MCP should expose.
 For example, adapt and run the following as an administrator:

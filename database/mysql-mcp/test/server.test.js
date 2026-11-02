@@ -668,6 +668,38 @@ test("enabled roles are expanded before grant validation", async () => {
   assert.match(statements[1], /SHOW GRANTS FOR CURRENT_USER\(\) USING 'mcp_read'@'%'/);
 });
 
+test("MySQL grants are re-verified after PRIVILEGE_RECHECK_SECONDS", async () => {
+  let grantQueries = 0;
+  let grant = "GRANT SELECT ON `appdb`.* TO `mcp`@`%`";
+  const connection = { release() {} };
+  const server = createServer({
+    verifyDbPrivileges: true,
+    privilegeRecheckMs: 60000,
+    securityVerified: true,
+    securityVerifiedAt: Date.now(),
+    securityVerificationPromise: null,
+    getConnection: async () => connection,
+    query: async (_target, sql) => {
+      if (sql.includes("ENABLED_ROLES")) return { rows: [] };
+      grantQueries += 1;
+      return { rows: [{ grant }] };
+    },
+  });
+  await server.ensureSecurityVerified();
+  assert.equal(grantQueries, 0);
+
+  server.securityVerifiedAt = Date.now() - 61000;
+  await server.ensureSecurityVerified();
+  assert.equal(grantQueries, 1);
+
+  server.securityVerifiedAt = Date.now() - 61000;
+  grant = "GRANT SELECT, DROP ON `appdb`.* TO `mcp`@`%`";
+  await assert.rejects(server.ensureSecurityVerified(), /unsafe privileges: DROP/);
+  assert.equal(server.securityVerified, false);
+  await assert.rejects(server.ensureSecurityVerified(), /unsafe privileges: DROP/);
+  assert.equal(grantQueries, 3, "a failed re-check is retried on the next call");
+});
+
 test("privilege-query protocol timeout destroys and never releases its explicit connection", async () => {
   const state = { destroyed: false, released: false };
   const connection = {

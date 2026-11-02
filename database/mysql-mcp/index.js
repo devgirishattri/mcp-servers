@@ -24,9 +24,11 @@ import {
   createSafeErrorResult,
   FILTERS_INPUT_SCHEMA,
   isLoopbackHost,
+  isPrivilegeVerificationFresh,
   parseCsvSet,
   parseNonNegativeInteger as parseSharedNonNegativeInteger,
   parsePositiveInteger as parseSharedPositiveInteger,
+  parsePrivilegeRecheckMs,
   requireMutationConfirmation,
   validateDataObject as validateSharedDataObject,
   validateFilters as validateSharedFilters,
@@ -231,6 +233,7 @@ class MySQLMCPServer {
       "load_file,sleep,benchmark,get_lock,release_lock,is_free_lock,is_used_lock,service_get_read_locks,service_release_locks,master_pos_wait,source_pos_wait,wait_for_executed_gtid_set,last_insert_id,row_count,found_rows,connection_id"
     );
     this.verifyDbPrivileges = process.env.VERIFY_DB_PRIVILEGES !== "false";
+    this.privilegeRecheckMs = parsePrivilegeRecheckMs(process.env.PRIVILEGE_RECHECK_SECONDS);
     this.maxRows = this.parseNonNegativeInteger(process.env.MAX_ROWS, 1000, "MAX_ROWS");
     this.maxAffectedRows = this.parseNonNegativeInteger(
       process.env.MAX_AFFECTED_ROWS,
@@ -287,6 +290,7 @@ class MySQLMCPServer {
     this.pool = mysql.createPool(this.buildConnectionConfig());
     this.securityVerificationPromise = null;
     this.securityVerified = false;
+    this.securityVerifiedAt = 0;
     this.setupToolHandlers();
     this.setupErrorHandlers();
   }
@@ -653,7 +657,12 @@ class MySQLMCPServer {
   }
 
   async ensureSecurityVerified() {
-    if (!this.verifyDbPrivileges || this.securityVerified) return;
+    if (
+      !this.verifyDbPrivileges ||
+      isPrivilegeVerificationFresh(this.securityVerified, this.securityVerifiedAt, this.privilegeRecheckMs)
+    ) {
+      return;
+    }
     if (!this.securityVerificationPromise) {
       this.securityVerificationPromise = (async () => {
         const connection = await this.getConnection();
@@ -676,7 +685,9 @@ class MySQLMCPServer {
             this.validateGrantStatement(Object.values(row)[0]);
           }
           this.securityVerified = true;
+          this.securityVerifiedAt = Date.now();
         } catch (error) {
+          this.securityVerified = false;
           if (this.isUnsafeTransactionError(error)) {
             this.destroyConnectionForError(connection, error);
             destroyed = true;

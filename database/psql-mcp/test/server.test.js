@@ -8,7 +8,13 @@ import {
   parseAllowedSchemas,
   PostgreSQLMCPServer,
 } from "../index.js";
-import { createLimitedLineInput, parseCsvSet } from "../../shared/security.js";
+import {
+  createLimitedLineInput,
+  isPrivilegeVerificationFresh,
+  objectsOutsideAllowlist,
+  parseCsvSet,
+  parsePrivilegeRecheckMs,
+} from "../../shared/security.js";
 
 function createServer(overrides = {}) {
   return Object.assign(Object.create(PostgreSQLMCPServer.prototype), {
@@ -523,6 +529,141 @@ test("privileged PostgreSQL roles are rejected", async () => {
     signalServer.ensureSecurityVerified(),
     /unsafe privileges: can_signal_backend/
   );
+});
+
+function verificationPool(privileges, relations, counter = { privilege: 0, relations: 0 }) {
+  return {
+    counter,
+    query: async (text) => {
+      if (text.includes("has_any_column_privilege")) {
+        counter.relations += 1;
+        return { rows: relations };
+      }
+      counter.privilege += 1;
+      return { rows: [privileges] };
+    },
+  };
+}
+
+async function captureStderr(callback) {
+  const original = console.error;
+  const lines = [];
+  console.error = (...args) => lines.push(args.join(" "));
+  try {
+    await callback();
+  } finally {
+    console.error = original;
+  }
+  return lines;
+}
+
+test("pg_read_all_data and pg_write_all_data memberships are rejected in both modes", async () => {
+  let verificationSql = "";
+  for (const mode of ["read", "write"]) {
+    for (const flag of ["can_read_all_data", "can_write_all_data"]) {
+      const server = createServer({
+        mode,
+        verifyDbPrivileges: true,
+        securityVerified: false,
+        securityVerificationPromise: null,
+        pool: {
+          query: async (text) => {
+            verificationSql = text;
+            return { rows: [{ rolsuper: false, [flag]: true }] };
+          },
+        },
+      });
+      await assert.rejects(server.ensureSecurityVerified(), new RegExp(`unsafe privileges: ${flag}`));
+    }
+  }
+  assert.match(verificationSql, /rolname = 'pg_read_all_data'/);
+  assert.doesNotMatch(verificationSql, /pg_has_role\(current_user, 'pg_read_all_data'/);
+});
+
+test("PostgreSQL grants outside the allowlists are refused with raw SELECT and logged otherwise", async () => {
+  const relations = [
+    { schema_name: "public", object_name: "orders" },
+    { schema_name: "hr", object_name: "pay" },
+  ];
+  const raw = createServer({
+    mode: "read",
+    verifyDbPrivileges: true,
+    securityVerified: false,
+    securityVerificationPromise: null,
+    grantScopeSummary: "",
+    pool: verificationPool({ rolsuper: false }, relations),
+  });
+  const errors = await captureStderr(() =>
+    assert.rejects(raw.ensureSecurityVerified(), /1 object\(s\) outside ALLOWED_SCHEMAS\/ALLOWED_TABLES/)
+  );
+  assert.match(errors.join("\n"), /ERROR: .*hr\.pay/);
+  assert.equal(raw.securityVerified, false);
+
+  const structured = createServer({
+    mode: "read",
+    allowArbitrarySelect: false,
+    verifyDbPrivileges: true,
+    securityVerified: false,
+    securityVerificationPromise: null,
+    grantScopeSummary: "",
+    pool: verificationPool({ rolsuper: false }, relations),
+  });
+  const warnings = await captureStderr(() => structured.ensureSecurityVerified());
+  assert.equal(structured.securityVerified, true);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /WARNING: .*1 object\(s\).*hr\.pay/);
+  assert.doesNotMatch(warnings[0], /public\.orders/);
+});
+
+test("PostgreSQL privileges are re-verified after PRIVILEGE_RECHECK_SECONDS", async () => {
+  const pool = verificationPool({ rolsuper: false }, []);
+  const server = createServer({
+    mode: "read",
+    verifyDbPrivileges: true,
+    privilegeRecheckMs: 60000,
+    securityVerified: true,
+    securityVerifiedAt: Date.now(),
+    securityVerificationPromise: null,
+    grantScopeSummary: "",
+    pool,
+  });
+  await server.ensureSecurityVerified();
+  assert.equal(pool.counter.privilege, 0);
+
+  server.securityVerifiedAt = Date.now() - 61000;
+  await Promise.all([server.ensureSecurityVerified(), server.ensureSecurityVerified()]);
+  assert.equal(pool.counter.privilege, 1);
+  assert.equal(pool.counter.relations, 1);
+  assert.ok(Date.now() - server.securityVerifiedAt < 5000);
+
+  server.securityVerifiedAt = Date.now() - 61000;
+  server.pool = verificationPool({ rolsuper: true }, []);
+  await assert.rejects(server.ensureSecurityVerified(), /unsafe privileges: rolsuper/);
+  assert.equal(server.securityVerified, false);
+});
+
+test("shared privilege recheck and allowlist helpers", () => {
+  assert.equal(parsePrivilegeRecheckMs(undefined), 300000);
+  assert.equal(parsePrivilegeRecheckMs("0"), 0);
+  assert.equal(parsePrivilegeRecheckMs("30"), 30000);
+  assert.throws(() => parsePrivilegeRecheckMs("-1"), /PRIVILEGE_RECHECK_SECONDS/);
+
+  assert.equal(isPrivilegeVerificationFresh(false, Date.now(), 0), false);
+  assert.equal(isPrivilegeVerificationFresh(true, 1, 0), true);
+  assert.equal(isPrivilegeVerificationFresh(true, 1000, 500, 1400), true);
+  assert.equal(isPrivilegeVerificationFresh(true, 1000, 500, 1500), false);
+
+  const objects = [
+    { schema: "Public", name: "Orders" },
+    { schema: "public", name: "audit" },
+    { schema: "hr", name: "pay" },
+  ];
+  assert.deepEqual(objectsOutsideAllowlist(objects, new Set(["public"]), new Set()), [objects[2]]);
+  assert.deepEqual(
+    objectsOutsideAllowlist(objects, new Set(["public"]), new Set(["public.orders"])),
+    [objects[1], objects[2]]
+  );
+  assert.deepEqual(objectsOutsideAllowlist(objects, new Set(), new Set()), []);
 });
 
 test("stdio input is rejected before an oversized JSON-RPC line reaches the SDK", async () => {

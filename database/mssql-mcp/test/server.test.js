@@ -493,6 +493,9 @@ test('privilege verification covers views, server permissions, and write-mode ex
   const poolWith = (row) => ({
     request: () => ({
       async query(text) {
+        if (text.includes('CROSS APPLY')) {
+          return { recordset: [] };
+        }
         sentQuery = text;
         return { recordset: [row] };
       },
@@ -522,6 +525,128 @@ test('privilege verification covers views, server permissions, and write-mode ex
     writer.verifyConnectionSecurity(poolWith({ has_object_alter_permission: 1 })),
     /has_object_alter_permission/
   );
+});
+
+function verificationPool(objects, counter = { privilege: 0, objects: 0 }) {
+  return {
+    counter,
+    request: () => ({
+      async query(text) {
+        if (text.includes('CROSS APPLY')) {
+          counter.objects += 1;
+          return { recordset: objects };
+        }
+        counter.privilege += 1;
+        return { recordset: [{ is_sysadmin: 0 }] };
+      },
+    }),
+  };
+}
+
+async function captureStderr(callback) {
+  const original = console.error;
+  const lines = [];
+  console.error = (...args) => lines.push(args.join(' '));
+  try {
+    await callback();
+  } finally {
+    console.error = original;
+  }
+  return lines;
+}
+
+test('grants outside the allowlists are refused with raw SELECT and logged otherwise', async () => {
+  const objects = [
+    { schema_name: 'dbo', object_name: 'orders' },
+    { schema_name: 'hr', object_name: 'pay' },
+  ];
+  const sentQueries = [];
+  const pool = {
+    request: () => ({
+      async query(text) {
+        sentQueries.push(text);
+        return text.includes('CROSS APPLY') ? { recordset: objects } : { recordset: [{}] };
+      },
+    }),
+  };
+
+  const raw = createServer({ mode: 'read', verifyDbPrivileges: true, grantScopeSummary: '' });
+  const rawLog = await captureStderr(() =>
+    assert.rejects(raw.verifyConnectionSecurity(pool), /1 object\(s\) outside ALLOWED_SCHEMAS\/ALLOWED_TABLES/)
+  );
+  assert.match(rawLog.join('\n'), /ERROR: .*hr\.pay/);
+  assert.match(sentQueries.at(-1), /'COLUMN'\) = 1/);
+
+  const structured = createServer({
+    mode: 'read',
+    verifyDbPrivileges: true,
+    allowArbitrarySelect: false,
+    grantScopeSummary: '',
+  });
+  const warnings = await captureStderr(async () => {
+    await structured.verifyConnectionSecurity(pool);
+    await structured.verifyConnectionSecurity(pool);
+  });
+  assert.equal(warnings.length, 1, 'an unchanged grant scope is logged once');
+  assert.match(warnings[0], /WARNING: .*hr\.pay/);
+
+  const narrowed = createServer({
+    mode: 'read',
+    verifyDbPrivileges: true,
+    allowedTables: new Set(['dbo.orders']),
+    allowedSchemas: new Set(['dbo', 'hr']),
+    grantScopeSummary: '',
+  });
+  await captureStderr(() =>
+    assert.rejects(narrowed.verifyConnectionSecurity(pool), /outside ALLOWED_SCHEMAS\/ALLOWED_TABLES/)
+  );
+  const covered = createServer({
+    mode: 'read',
+    verifyDbPrivileges: true,
+    allowedSchemas: new Set(['dbo', 'hr']),
+    grantScopeSummary: '',
+  });
+  await assert.doesNotReject(covered.verifyConnectionSecurity(pool));
+});
+
+test('privileges are re-verified on the pool after PRIVILEGE_RECHECK_SECONDS', async () => {
+  const pool = verificationPool([{ schema_name: 'dbo', object_name: 'orders' }]);
+  const server = createServer({
+    mode: 'read',
+    verifyDbPrivileges: true,
+    privilegeRecheckMs: 60000,
+    securityVerified: true,
+    securityVerifiedAt: Date.now(),
+    securityVerificationPromise: null,
+    grantScopeSummary: '',
+    pool,
+  });
+  assert.equal(await server.getPool(), pool);
+  assert.equal(pool.counter.privilege, 0, 'a fresh verification is reused');
+
+  server.securityVerifiedAt = Date.now() - 61000;
+  await Promise.all([server.getPool(), server.getPool()]);
+  assert.equal(pool.counter.privilege, 1, 'concurrent callers share one re-verification');
+  assert.equal(pool.counter.objects, 1);
+
+  server.securityVerifiedAt = Date.now() - 61000;
+  pool.request = () => ({
+    async query() {
+      return { recordset: [{ is_sysadmin: 1 }] };
+    },
+  });
+  await assert.rejects(server.getPool(), /unsafe privileges: is_sysadmin/);
+  assert.equal(server.securityVerified, false, 'a failed re-check blocks later calls until it passes');
+
+  const once = createServer({
+    verifyDbPrivileges: true,
+    privilegeRecheckMs: 0,
+    securityVerified: true,
+    securityVerifiedAt: 1,
+    pool: verificationPool([]),
+  });
+  await once.getPool();
+  assert.equal(once.pool.counter.privilege, 0, 'PRIVILEGE_RECHECK_SECONDS=0 verifies once');
 });
 
 test('stored procedure output is bounded while the procedure runs to completion', async () => {
