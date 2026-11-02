@@ -21,11 +21,11 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "pg": "^8.13.1",
+    "pg": "^8.23.1",
     "dotenv": "^16.4.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/pg": "^8.11.10"
+    "@types/pg": "^8.23.1"
   }
 }
